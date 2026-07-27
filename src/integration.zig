@@ -639,3 +639,159 @@ test "battle: permission-denied surfaces as a typed error" {
         .{},
     ));
 }
+
+test "battle: parallel worker failure skips one file but completes the rest" {
+    // A batch where one target is unwritable (root-owned parent /). runParallel
+    // must skip that file, still transfer the other two, and surface
+    // error.Failure rather than silently exit 0.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+    const local_a = "zioscp_pwf_a.bin";
+    const local_b = "zioscp_pwf_b.bin";
+    const local_c = "zioscp_pwf_c.bin";
+    const remote_a = "/config/zioscp_pwf_a.bin";
+    const remote_bad = "/zioscp_pwf_fail.bin"; // parent / is root-owned -> denied
+    const remote_c = "/config/zioscp_pwf_c.bin";
+    defer cwd.deleteFile(io, local_a) catch {};
+    defer cwd.deleteFile(io, local_b) catch {};
+    defer cwd.deleteFile(io, local_c) catch {};
+
+    const a = [_]u8{ 'a', 'a', 'a', 'a' };
+    const b = [_]u8{ 'b', 'b', 'b', 'b' };
+    const c = [_]u8{ 'c', 'c', 'c', 'c' };
+    try cwd.writeFile(io, .{ .sub_path = local_a, .data = &a });
+    try cwd.writeFile(io, .{ .sub_path = local_b, .data = &b });
+    try cwd.writeFile(io, .{ .sub_path = local_c, .data = &c });
+
+    // Build the task list manually with owned strings (freed via freeTasks).
+    var list: std.ArrayList(engine.Task) = .empty;
+    defer engine.freeTasks(testing.allocator, &list);
+    try list.append(testing.allocator, .{
+        .direction = .upload,
+        .local = try testing.allocator.dupe(u8, local_a),
+        .remote = try testing.allocator.dupe(u8, remote_a),
+    });
+    try list.append(testing.allocator, .{
+        .direction = .upload,
+        .local = try testing.allocator.dupe(u8, local_b),
+        .remote = try testing.allocator.dupe(u8, remote_bad),
+    });
+    try list.append(testing.allocator, .{
+        .direction = .upload,
+        .local = try testing.allocator.dupe(u8, local_c),
+        .remote = try testing.allocator.dupe(u8, remote_c),
+    });
+
+    const argv = sshArgv();
+    try testing.expectError(error.Failure, engine.runParallel(
+        testing.allocator,
+        &argv,
+        list.items,
+        .{ .chunk_size = 8192 },
+        3,
+    ));
+
+    // The two writable targets landed; the denied one was never created.
+    var sc = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer sc.deinit();
+    defer sc.sess.remove(remote_a) catch {};
+    defer sc.sess.remove(remote_c) catch {};
+    try testing.expectEqual(@as(u64, a.len), (try sc.sess.stat(remote_a)).size);
+    try testing.expectEqual(@as(u64, c.len), (try sc.sess.stat(remote_c)).size);
+    try testing.expectError(error.NoSuchFile, sc.sess.stat(remote_bad));
+}
+
+// ---- Battle tests: connection drop ----------------------------------------
+
+const DropCtx = struct {
+    gpa: std.mem.Allocator,
+    argv: []const []const u8,
+    local: []const u8,
+    remote: []const u8,
+    opts: engine.Options,
+    result: ?anyerror = null,
+    // Child pid once the worker has connected; -1 until then. Read from the
+    // killer thread to drop the connection without sharing the worker's io.
+    pid: std.atomic.Value(std.posix.pid_t),
+};
+
+fn dropUpload(ctx: *DropCtx) void {
+    // Own io + Connection on this thread; the main thread kills via posix.kill
+    // so the two threads never share an io (no deadlock risk).
+    var threaded = std.Io.Threaded.init(ctx.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = transport.Connection.open(ctx.gpa, io, ctx.argv) catch {
+        ctx.result = error.IoClosed;
+        return;
+    };
+    defer conn.deinit();
+    if (conn.proc.child.id) |pid| ctx.pid.store(pid, .release);
+    ctx.result = if (engine.uploadFile(ctx.gpa, io, &conn.sess, ctx.local, ctx.remote, ctx.opts)) |_| null else |err| err;
+}
+
+test "battle: connection drop mid-upload surfaces an error and leaves a resumable partial" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+    const local = "zioscp_drop_src.bin";
+    const remote = "/config/zioscp_drop.bin";
+    const sidecar = "zioscp_drop_src.bin.zioscppart";
+    const pulled = "zioscp_drop_dst.bin";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer cwd.deleteFile(io, pulled) catch {};
+
+    // 2 MiB paced at 512 KiB/s ~= 4 s total. The pipelined uploader does not
+    // ACK its first chunk until the 16-deep window fills (~window * interval),
+    // so the kill must land comfortably past that and well before completion:
+    // ~0.25 s to first ACK, kill at ~1.5 s, ~4 s to finish.
+    const n: usize = 2 * 1024 * 1024;
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+    try cwd.writeFile(io, .{ .sub_path = local, .data = payload });
+
+    const argv = sshArgv();
+    var ctx: DropCtx = .{
+        .gpa = testing.allocator,
+        .argv = &argv,
+        .local = local,
+        .remote = remote,
+        .opts = .{ .chunk_size = 8192, .bwlimit_bps = 512 * 1024 },
+        .pid = std.atomic.Value(std.posix.pid_t).init(-1),
+    };
+    const thread = std.Thread.spawn(.{}, dropUpload, .{&ctx}) catch return error.OutOfMemory;
+
+    // Wait for the worker to connect (pid published), then let it transfer.
+    var spin: usize = 0;
+    while (ctx.pid.load(.acquire) < 0 and spin < 3000) : (spin += 1) {
+        std.Io.sleep(io, .{ .nanoseconds = 1_000_000 }, .awake) catch {};
+    }
+    std.Io.sleep(io, .{ .nanoseconds = 1_500_000_000 }, .awake) catch {};
+    // Drop the connection hard.
+    const pid = ctx.pid.load(.acquire);
+    if (pid > 0) std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    thread.join();
+
+    // The upload must have failed (connection lost), not hung or succeeded.
+    try testing.expect(ctx.result != null);
+    try testing.expectEqual(error.IoClosed, ctx.result.?);
+    // A resumable partial was recorded before the drop.
+    try testing.expect((cwd.statFile(io, sidecar, .{}) catch null) != null);
+
+    // Resume on a fresh connection and confirm the whole file is correct.
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+    defer conn.sess.remove(remote) catch {};
+    try engine.uploadFile(testing.allocator, io, &conn.sess, local, remote, .{ .chunk_size = 8192, .resume_enabled = true });
+    try engine.downloadFile(testing.allocator, io, &conn.sess, remote, pulled, .{ .chunk_size = 8192 });
+    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, payload, got);
+}
