@@ -234,6 +234,23 @@ pub fn encodeWrite(
     try w.writeAll(data);
 }
 
+/// WRITE framing + header ONLY (length, type, id, handle, offset, data_len),
+/// without the data bytes. Lets a caller write the header from a small stack
+/// buffer and stream `data` directly to the wire, avoiding a per-write
+/// allocation/copy of the payload on the hot upload path.
+pub fn encodeWriteHeader(
+    w: *std.Io.Writer,
+    id: u32,
+    handle: []const u8,
+    offset: u64,
+    data_len: usize,
+) std.Io.Writer.Error!void {
+    try writeFrameHeader(w, .write, id, stringLen(handle) + 8 + 4 + data_len);
+    try writeString(w, handle);
+    try writeU64Be(w, offset);
+    try writeU32Be(w, @intCast(data_len));
+}
+
 pub fn encodeStat(w: *std.Io.Writer, id: u32, path: []const u8) std.Io.Writer.Error!void {
     try writeFrameHeader(w, .stat, id, stringLen(path));
     try writeString(w, path);

@@ -204,7 +204,28 @@ pub fn Session(comptime Duplex: type) type {
 
         pub fn write(self: *Self, handle: []const u8, offset: u64, data: []const u8) Error!void {
             const id = self.allocId();
-            try self.send(packets.encodeWrite, .{ id, handle, offset, data });
+            // Hot path: WRITE header from a stack buffer + the payload streamed
+            // straight to the wire. Avoids the per-write Allocating writer (one
+            // ~32 KiB alloc + an extra copy of the payload per chunk), which the
+            // benchmark showed was the bulk of zioscp-j1's overhead vs scp.
+            var hdr: [256]u8 = undefined;
+            var hw = std.Io.Writer.fixed(&hdr);
+            packets.encodeWriteHeader(&hw, id, handle, offset, data.len) catch {
+                // Oversized handle: fall back to the allocating encode path.
+                try self.send(packets.encodeWrite, .{ id, handle, offset, data });
+                try self.expectOk(id);
+                return;
+            };
+            self.dup.writeAll(hdr[0..hw.end]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.IoClosed,
+            };
+            if (data.len > 0) {
+                self.dup.writeAll(data) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.IoClosed,
+                };
+            }
             try self.expectOk(id);
         }
 
