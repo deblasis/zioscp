@@ -1,37 +1,37 @@
 //! zioscp CLI: drop-in scp over SFTP, with resume.
 //!
 //! Usage: zioscp [options] src dest  (exactly one of src/dest is remote).
-//! A remote path is written `[user@]host:path`, scp-style.
+//! A remote path is written `[user@]host:path`, scp-style. Flags are parsed
+//! from a typed struct via zioarg, which also generates --help.
 
 const std = @import("std");
 const transport = @import("transport.zig");
 const engine = @import("engine.zig");
 const packets = @import("sftp/packets.zig");
+const zioarg = @import("zioarg");
 
-fn isLocalDir(io: std.Io, path: []const u8) bool {
-    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
-    return st.kind == .directory;
-}
+const Args = struct {
+    port: []const u8 = "22",
+    identity: ?[]const u8 = null,
+    recursive: bool = false,
+    preserve: bool = false,
+    no_resume: bool = false,
+    chunk_size: u32 = 8 * 1024 * 1024,
+    bwlimit: u64 = 0,
+    files: []const []const u8 = &.{},
 
-const usage =
-    \\zioscp - drop-in scp over SFTP, with resume
-    \\
-    \\Usage:
-    \\  zioscp [options] src dest
-    \\
-    \\One of src/dest must be remote ([user@]host:path), the other local.
-    \\
-    \\Options:
-    \\  -P PORT          ssh port (default 22)
-    \\  -i KEY           identity file
-    \\  -r               copy directories recursively
-    \\  -p               preserve file permissions
-    \\  --bwlimit BPS    limit transfer to BPS bytes/sec (default unlimited)
-    \\  --chunk-size N   transfer chunk size in bytes (default 8 MiB)
-    \\  --no-resume      overwrite from the start instead of resuming
-    \\  -h, --help       show this help
-    \\
-;
+    pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p' };
+    pub const help = .{
+        .port = "ssh port (default 22)",
+        .identity = "identity file",
+        .recursive = "copy directories recursively",
+        .preserve = "preserve file permissions",
+        .no_resume = "overwrite from the start instead of resuming",
+        .chunk_size = "transfer chunk size in bytes (default 8 MiB)",
+        .bwlimit = "limit transfer to N bytes/sec (default unlimited)",
+        .files = "src dest (one remote [user@]host:path, one local)",
+    };
+};
 
 const RemoteSpec = struct { user_host: []const u8, path: []const u8 };
 
@@ -49,65 +49,50 @@ fn bail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
+fn printHelp(io: std.Io) void {
+    var buf: [4096]u8 = undefined;
+    var fw = std.Io.File.stderr().writer(io, &buf);
+    zioarg.formatHelp(Args, &fw.interface) catch {};
+    fw.interface.flush() catch {};
+}
+
+fn isLocalDir(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .directory;
+}
+
+fn remoteIsDir(sess: anytype, path: []const u8) bool {
+    const a = sess.stat(path) catch return false;
+    return (a.flags & packets.ATTR_PERMISSIONS != 0) and
+        ((a.permissions & 0o170000) == 0o040000);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const args = init.minimal.args.toSlice(gpa) catch bail("failed to read args", .{});
-    defer gpa.free(args);
-
-    var port: []const u8 = "22";
-    var identity: ?[]const u8 = null;
-    var chunk_size: u32 = 8 * 1024 * 1024;
-    var resume_enabled = true;
-    var recursive = false;
-    var preserve = false;
-    var bwlimit_bps: u64 = 0;
-    var positionals: [2][]const u8 = .{ "", "" };
-    var npos: usize = 0;
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            std.debug.print("{s}\n", .{usage});
+    var parsed = zioarg.parse(Args, gpa, init.minimal.args) catch |err| switch (err) {
+        error.HelpRequested => {
+            printHelp(io);
             return;
-        } else if (std.mem.eql(u8, a, "-P")) {
-            i += 1;
-            if (i >= args.len) bail("{s}", .{usage});
-            port = args[i];
-        } else if (std.mem.eql(u8, a, "-i")) {
-            i += 1;
-            if (i >= args.len) bail("{s}", .{usage});
-            identity = args[i];
-        } else if (std.mem.eql(u8, a, "--no-resume")) {
-            resume_enabled = false;
-        } else if (std.mem.eql(u8, a, "--bwlimit")) {
-            i += 1;
-            if (i >= args.len) bail("{s}", .{usage});
-            bwlimit_bps = std.fmt.parseInt(u64, args[i], 10) catch bail("bad --bwlimit (bytes/sec)", .{});
-        } else if (std.mem.eql(u8, a, "-r")) {
-            recursive = true;
-        } else if (std.mem.eql(u8, a, "-p")) {
-            preserve = true;
-        } else if (std.mem.eql(u8, a, "--chunk-size")) {
-            i += 1;
-            if (i >= args.len) bail("{s}", .{usage});
-            chunk_size = std.fmt.parseInt(u32, args[i], 10) catch bail("bad --chunk-size", .{});
-        } else if (a.len > 0 and a[0] == '-') {
-            bail("unknown option: {s}", .{a});
-        } else {
-            if (npos >= 2) bail("{s}", .{usage});
-            positionals[npos] = a;
-            npos += 1;
-        }
-    }
-    if (npos != 2) bail("{s}", .{usage});
+        },
+        else => {
+            zioarg.reportError(Args, err);
+            printHelp(io);
+            std.process.exit(1);
+        },
+    };
+    defer parsed.deinit(gpa);
+    const v = parsed.value;
 
-    const src = positionals[0];
-    const dest = positionals[1];
+    if (v.files.len != 2) {
+        printHelp(io);
+        std.process.exit(1);
+    }
+    const src = v.files[0];
+    const dest = v.files[1];
     const src_remote = remoteSpec(src);
     const dest_remote = remoteSpec(dest);
     if (src_remote == null and dest_remote == null) bail("one of src/dest must be remote (host:path)", .{});
@@ -122,11 +107,11 @@ pub fn main(init: std.process.Init) !void {
     var ssh_argv: std.ArrayList([]const u8) = .empty;
     ssh_argv.append(aa, "ssh") catch bail("oom", .{});
     ssh_argv.append(aa, "-T") catch bail("oom", .{});
-    if (!std.mem.eql(u8, port, "22")) {
+    if (!std.mem.eql(u8, v.port, "22")) {
         ssh_argv.append(aa, "-p") catch bail("oom", .{});
-        ssh_argv.append(aa, port) catch bail("oom", .{});
+        ssh_argv.append(aa, v.port) catch bail("oom", .{});
     }
-    if (identity) |k| {
+    if (v.identity) |k| {
         ssh_argv.append(aa, "-i") catch bail("oom", .{});
         ssh_argv.append(aa, k) catch bail("oom", .{});
     }
@@ -137,14 +122,19 @@ pub fn main(init: std.process.Init) !void {
     ssh_argv.append(aa, spec.user_host) catch bail("oom", .{});
     ssh_argv.append(aa, "sftp") catch bail("oom", .{});
 
-    const opts: engine.Options = .{ .chunk_size = chunk_size, .resume_enabled = resume_enabled, .preserve = preserve, .bwlimit_bps = bwlimit_bps };
+    const opts: engine.Options = .{
+        .chunk_size = v.chunk_size,
+        .resume_enabled = !v.no_resume,
+        .preserve = v.preserve,
+        .bwlimit_bps = v.bwlimit,
+    };
 
     var conn = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
         bail("connection failed: {s}", .{@errorName(err)});
     defer conn.deinit();
 
     if (download) {
-        if (recursive and remoteIsDir(&conn.sess, spec.path)) {
+        if (v.recursive and remoteIsDir(&conn.sess, spec.path)) {
             engine.downloadDir(gpa, io, &conn.sess, spec.path, dest, opts) catch |err|
                 bail("download failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
         } else {
@@ -152,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
                 bail("download failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
         }
     } else {
-        if (recursive and isLocalDir(io, src)) {
+        if (v.recursive and isLocalDir(io, src)) {
             engine.uploadDir(gpa, io, &conn.sess, src, spec.path, opts) catch |err|
                 bail("upload failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
         } else {
@@ -160,10 +150,4 @@ pub fn main(init: std.process.Init) !void {
                 bail("upload failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
         }
     }
-}
-
-fn remoteIsDir(sess: anytype, path: []const u8) bool {
-    const a = sess.stat(path) catch return false;
-    return (a.flags & packets.ATTR_PERMISSIONS != 0) and
-        ((a.permissions & 0o170000) == 0o040000);
 }

@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("ziorate");
+    const zioarg_mod = b.dependency("zioarg", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zioarg");
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -31,6 +35,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("ziojson", ziojson_mod);
     exe_mod.addImport("zioprogress", zioprogress_mod);
     exe_mod.addImport("ziorate", ziorate_mod);
+    exe_mod.addImport("zioarg", zioarg_mod);
     const exe = b.addExecutable(.{
         .name = "zioscp",
         .root_module = exe_mod,
