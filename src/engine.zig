@@ -605,9 +605,11 @@ pub fn runParallel(
 // sparse intermediate state is overwritten as ranges fill in. Download mirrors
 // this with concurrent remote reads + positional local writes.
 //
-// Resume is NOT coordinated in P3 v1 (a re-run re-truncates and restarts);
-// per-chunk resume is a follow-on. Small files (<=1 chunk) fall back to the
-// single-stream path.
+// Resume: a `.zioscpchunks` bitmap sidecar (resume.zig) records each completed
+// chunk. On a re-run, done chunks are skipped and the dest is NOT re-truncated,
+// so an interrupted chunked transfer continues instead of restarting. Small
+// files (<=1 chunk) fall back to the single-stream path (which has its own
+// offset + MAC resume).
 
 const ChunkCtx = struct {
     gpa: std.mem.Allocator,
@@ -615,6 +617,10 @@ const ChunkCtx = struct {
     opts: Options,
     local_path: []const u8,
     remote_path: []const u8,
+    bitmap_path: []const u8,
+    /// Loaded completion bitmap for this transfer (read-only during the run);
+    /// empty on a fresh start. Includes the 12-byte header.
+    done: []const u8,
     total: u64,
     chunk: u32,
     count: u64,
@@ -640,6 +646,7 @@ fn uploadChunkWorker(ctx: *ChunkCtx) void {
     while (true) {
         const idx = ctx.next.fetchAdd(1, .monotonic);
         if (idx >= ctx.count) break;
+        if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
         const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
         if (r.len == 0) continue;
         _ = local.readPositionalAll(io, buf[0..@intCast(r.len)], r.offset) catch {
@@ -648,7 +655,9 @@ fn uploadChunkWorker(ctx: *ChunkCtx) void {
         };
         conn.sess.write(handle, r.offset, buf[0..@intCast(r.len)]) catch {
             _ = ctx.errors.fetchAdd(1, .monotonic);
+            continue;
         };
+        resume_mod.markChunkDone(io, ctx.bitmap_path, idx) catch {};
     }
 }
 
@@ -668,6 +677,7 @@ fn downloadChunkWorker(ctx: *ChunkCtx) void {
     while (true) {
         const idx = ctx.next.fetchAdd(1, .monotonic);
         if (idx >= ctx.count) break;
+        if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
         const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
         if (r.len == 0) continue;
         const want: u32 = @intCast(r.len);
@@ -682,7 +692,9 @@ fn downloadChunkWorker(ctx: *ChunkCtx) void {
         if (piece.len == 0) break;
         local.writePositionalAll(io, piece, r.offset) catch {
             _ = ctx.errors.fetchAdd(1, .monotonic);
+            continue;
         };
+        resume_mod.markChunkDone(io, ctx.bitmap_path, idx) catch {};
     }
 }
 
@@ -711,15 +723,32 @@ pub fn uploadFileParallel(
         return;
     }
 
-    // Pre-truncate the remote fresh (the only truncation).
-    {
-        var c = try transport.Connection.open(gpa, io0, ssh_argv);
-        defer c.deinit();
-        const h = try c.sess.open(remote_path, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
-        defer {
-            c.sess.close(h) catch {};
-            gpa.free(h);
+    // Resume: load any completion bitmap for this (total, chunk).
+    const bitmap_path = try resume_mod.chunkBitmapPath(gpa, local_path);
+    defer gpa.free(bitmap_path);
+    var done: []u8 = &.{};
+    var is_resume = false;
+    if (opts.resume_enabled) {
+        if (try resume_mod.loadChunkBitmap(io0, gpa, bitmap_path, total, chunk)) |b| {
+            done = b;
+            is_resume = true;
         }
+    }
+    defer if (done.len > 0) gpa.free(done);
+
+    // Fresh run: truncate the remote and start a new bitmap. On resume keep the
+    // partial remote and its bitmap (already loaded).
+    if (!is_resume) {
+        {
+            var c = try transport.Connection.open(gpa, io0, ssh_argv);
+            defer c.deinit();
+            const h = try c.sess.open(remote_path, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+            defer {
+                c.sess.close(h) catch {};
+                gpa.free(h);
+            }
+        }
+        try resume_mod.initChunkBitmap(io0, bitmap_path, total, chunk);
     }
 
     var ctx: ChunkCtx = .{
@@ -728,6 +757,8 @@ pub fn uploadFileParallel(
         .opts = opts,
         .local_path = local_path,
         .remote_path = remote_path,
+        .bitmap_path = bitmap_path,
+        .done = done,
         .total = total,
         .chunk = chunk,
         .count = count,
@@ -736,6 +767,7 @@ pub fn uploadFileParallel(
     };
     try spawnChunkWorkers(gpa, uploadChunkWorker, &ctx, jobs, count);
     if (ctx.errors.load(.monotonic) != 0) return error.Failure;
+    resume_mod.removeFile(io0, bitmap_path);
 }
 
 /// Download a single file in parallel across `jobs` ssh connections.
@@ -763,10 +795,25 @@ pub fn downloadFileParallel(
         return;
     }
 
-    // Pre-create+truncate the local file fresh.
-    {
+    // Resume: load any completion bitmap for this (total, chunk).
+    const bitmap_path = try resume_mod.chunkBitmapPath(gpa, local_path);
+    defer gpa.free(bitmap_path);
+    var done: []u8 = &.{};
+    var is_resume = false;
+    if (opts.resume_enabled) {
+        if (try resume_mod.loadChunkBitmap(io0, gpa, bitmap_path, total, chunk)) |b| {
+            done = b;
+            is_resume = true;
+        }
+    }
+    defer if (done.len > 0) gpa.free(done);
+
+    // Fresh run: create+truncate the local file and start a new bitmap. On
+    // resume keep the partial local file and its bitmap (already loaded).
+    if (!is_resume) {
         var f = try std.Io.Dir.cwd().createFile(io0, local_path, .{ .truncate = true });
         f.close(io0);
+        try resume_mod.initChunkBitmap(io0, bitmap_path, total, chunk);
     }
 
     var ctx: ChunkCtx = .{
@@ -775,6 +822,8 @@ pub fn downloadFileParallel(
         .opts = opts,
         .local_path = local_path,
         .remote_path = remote_path,
+        .bitmap_path = bitmap_path,
+        .done = done,
         .total = total,
         .chunk = chunk,
         .count = count,
@@ -783,6 +832,7 @@ pub fn downloadFileParallel(
     };
     try spawnChunkWorkers(gpa, downloadChunkWorker, &ctx, jobs, count);
     if (ctx.errors.load(.monotonic) != 0) return error.Failure;
+    resume_mod.removeFile(io0, bitmap_path);
 }
 
 fn spawnChunkWorkers(

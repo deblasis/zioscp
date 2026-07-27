@@ -165,6 +165,67 @@ pub fn macCount(io: std.Io, path: []const u8) !u64 {
     return st.size / mac_line_len;
 }
 
+// --- P3 chunk bitmap (parallel single-file resume) ------------------------
+// For chunked-parallel (-j on one file) resume. Layout:
+//   [8 bytes total, big-endian][4 bytes chunk, big-endian][count bytes bitmap]
+// bitmap[idx] == '1' once chunk idx is fully done. Each mark is a positional
+// 1-byte write, so completing a chunk never rewrites earlier marks (no O(n^2)).
+// On resume, chunks marked done are skipped and the dest is not re-truncated;
+// the header (total+chunk) validates the bitmap is for the same transfer, so a
+// changed source size falls back to a fresh start.
+
+pub const bitmap_header_len: usize = 12;
+
+pub fn chunkBitmapPath(gpa: std.mem.Allocator, dest_path: []const u8) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}.zioscpchunks", .{dest_path}) catch error.OutOfMemory;
+}
+
+/// Start a fresh bitmap sidecar: truncate any stale file and write the header.
+pub fn initChunkBitmap(io: std.Io, path: []const u8, total: u64, chunk: u32) !void {
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    var hdr: [bitmap_header_len]u8 = undefined;
+    std.mem.writeInt(u64, hdr[0..8], total, .big);
+    std.mem.writeInt(u32, hdr[8..12], chunk, .big);
+    try f.writePositionalAll(io, &hdr, 0);
+}
+
+/// Record chunk `idx` complete (positional 1-byte write; concurrent-safe across
+/// workers since each writes a distinct offset).
+pub fn markChunkDone(io: std.Io, path: []const u8, idx: u64) !void {
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+    defer f.close(io);
+    const mark: [1]u8 = .{'1'};
+    try f.writePositionalAll(io, &mark, bitmap_header_len + idx);
+}
+
+/// Load the bitmap for a (total, chunk); null if absent or for a different
+/// transfer (stale). The returned bytes include the 12-byte header; the bitmap
+/// is `bytes[bitmap_header_len..]`. Caller frees.
+pub fn loadChunkBitmap(io: std.Io, gpa: std.mem.Allocator, path: []const u8, total: u64, chunk: u32) !?[]u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (bytes.len < bitmap_header_len) {
+        gpa.free(bytes);
+        return null;
+    }
+    const ft = std.mem.readInt(u64, bytes[0..8], .big);
+    const fc = std.mem.readInt(u32, bytes[8..12], .big);
+    if (ft != total or fc != chunk) {
+        gpa.free(bytes);
+        return null;
+    }
+    return bytes;
+}
+
+/// True if chunk `idx` is marked done in `bitmap` (the loaded sidecar bytes).
+pub fn chunkDone(bitmap: []const u8, idx: u64) bool {
+    const off = bitmap_header_len + idx;
+    return off < bitmap.len and bitmap[off] == '1';
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

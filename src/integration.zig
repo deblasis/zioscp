@@ -802,3 +802,106 @@ test "battle: connection drop mid-upload surfaces an error and leaves a resumabl
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(u8, payload, got);
 }
+
+// ---- Battle tests: P3 (chunked-parallel) resume --------------------------
+
+test "battle: P3 upload resume skips done chunks and fills the rest" {
+    // Pre-write chunk 0 to the remote with one byte flipped, mark ONLY chunk 0
+    // done in the bitmap, then resume. A correct resume must skip chunk 0 (the
+    // flipped byte survives = it was not re-sent) and fill chunks 1.. from the
+    // source, then remove the bitmap on success.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const local = "zioscp_p3r_up.bin";
+    const remote = "/config/zioscp_p3r_up.bin";
+    const pulled = "zioscp_p3r_up_pulled.bin";
+    const bitmap = "zioscp_p3r_up.bin.zioscpchunks";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, pulled) catch {};
+    defer cwd.deleteFile(io, bitmap) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    const n: usize = 200_000; // 25 chunks at 8 KiB
+    const chunk: u32 = 8192;
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 7) % 251);
+    try cwd.writeFile(io, .{ .sub_path = local, .data = payload });
+
+    // Remote partial: chunk 0 with byte 100 flipped; file size only 8192.
+    var c0 = testing.allocator.dupe(u8, payload[0..chunk]) catch return error.OutOfMemory;
+    defer testing.allocator.free(c0);
+    c0[100] ^= 0xff;
+    const wh = try conn.sess.open(remote, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+    defer testing.allocator.free(wh);
+    try conn.sess.write(wh, 0, c0);
+    try conn.sess.close(wh);
+    // Bitmap: header + only chunk 0 marked done.
+    try resume_mod.initChunkBitmap(io, bitmap, n, chunk);
+    try resume_mod.markChunkDone(io, bitmap, 0);
+
+    const argv = sshArgv();
+    try engine.uploadFileParallel(testing.allocator, &argv, local, remote, .{ .chunk_size = chunk, .resume_enabled = true }, 4);
+
+    try engine.downloadFile(testing.allocator, io, &conn.sess, remote, pulled, .{ .chunk_size = chunk });
+    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, n), got.len);
+    try testing.expect(got[100] != payload[100]); // chunk 0 was SKIPPED (flipped byte survives)
+    try testing.expectEqualSlices(u8, payload[chunk..], got[chunk..]); // chunks 1.. filled from source
+    try testing.expect((cwd.statFile(io, bitmap, .{}) catch null) == null); // bitmap removed on success
+}
+
+test "battle: P3 download resume skips done chunks and fills the rest" {
+    // Symmetric: a correct full remote; a local partial with chunk 0 (flipped)
+    // marked done. Resume must skip chunk 0 (flipped byte survives) and fill the
+    // rest from the remote.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const local = "zioscp_p3r_dn.bin";
+    const remote = "/config/zioscp_p3r_dn.bin";
+    const bitmap = "zioscp_p3r_dn.bin.zioscpchunks";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, bitmap) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    const n: usize = 200_000;
+    const chunk: u32 = 8192;
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 11) % 251);
+
+    // Full correct remote.
+    const wh = try conn.sess.open(remote, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+    defer testing.allocator.free(wh);
+    try conn.sess.write(wh, 0, payload);
+    try conn.sess.close(wh);
+
+    // Local partial: chunk 0 (flipped) only.
+    var c0 = testing.allocator.dupe(u8, payload[0..chunk]) catch return error.OutOfMemory;
+    defer testing.allocator.free(c0);
+    c0[100] ^= 0xff;
+    try cwd.writeFile(io, .{ .sub_path = local, .data = c0 });
+    try resume_mod.initChunkBitmap(io, bitmap, n, chunk);
+    try resume_mod.markChunkDone(io, bitmap, 0);
+
+    const argv = sshArgv();
+    try engine.downloadFileParallel(testing.allocator, &argv, remote, local, .{ .chunk_size = chunk, .resume_enabled = true }, 4);
+
+    const got = cwd.readFileAlloc(io, local, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, n), got.len);
+    try testing.expect(got[100] != payload[100]); // chunk 0 SKIPPED
+    try testing.expectEqualSlices(u8, payload[chunk..], got[chunk..]); // chunks 1.. filled
+    try testing.expect((cwd.statFile(io, bitmap, .{}) catch null) == null);
+}
