@@ -305,28 +305,45 @@ pub fn downloadFile(
         try Dir.cwd().createFile(io, local_path, .{ .truncate = false });
     defer local.close(io);
 
-    const buf = try gpa.alloc(u8, effectiveChunk(opts));
-    defer gpa.free(buf);
-    var off = next_off;
+    // Pipelined download: keep up to `window` READs in flight to hide RTT,
+    // mirroring the upload pipeline. SFTP processes requests FIFO, so the Nth
+    // DATA reply corresponds to the Nth READ; `write_off` tracks where the next
+    // reply lands. OpenSSH's ssh buffers DATA internally when the stdout pipe
+    // is full (flow control, not a deadlock), so a single-threaded fill/drain
+    // keeps the server's read path saturated under high RTT.
+    const chunk = effectiveChunk(opts);
+    const window: usize = 256;
+    var read_off: u64 = next_off;
+    var write_off: u64 = next_off;
+    var in_flight: usize = 0;
     var prog = Progress.start(io, local_path, total, opts, next_off);
-    var pacer = Pacer.init(io, opts, effectiveChunk(opts));
-    while (off < total) {
-        pacer.wait();
-        const want: u32 = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
-        const piece = sess.read(rh, off, want) catch |err| switch (err) {
-            error.Eof => break,
-            else => return err,
+    var pacer = Pacer.init(io, opts, chunk);
+    while (read_off < total or in_flight > 0) {
+        while (in_flight < window and read_off < total) {
+            pacer.wait();
+            const want: u32 = @intCast(@min(@as(u64, chunk), total - read_off));
+            try sess.sendReadUnacked(rh, read_off, want);
+            read_off += want;
+            in_flight += 1;
+        }
+        const piece = sess.recvData() catch |err| {
+            // recvData consumed one reply (or the link died). Best-effort drain
+            // the remaining in-flight replies so a recoverable failure does not
+            // desynchronize the session for a caller that reuses it.
+            if (in_flight > 0) in_flight -= 1;
+            while (in_flight > 0) : (in_flight -= 1) _ = sess.recvData() catch {};
+            return err;
         };
-        defer gpa.free(piece); // frees this iteration's slice
-        if (piece.len == 0) break;
-        try local.writePositionalAll(io, piece, off);
+        in_flight -= 1;
+        try local.writePositionalAll(io, piece, write_off);
         // Record this chunk's MAC for integrity-checked resume.
         if (chunker.hashChunk(gpa, piece)) |mac| {
-            resume_mod.appendMac(io, mac_path, mac, off / @as(u64, effectiveChunk(opts))) catch {};
+            resume_mod.appendMac(io, mac_path, mac, write_off / @as(u64, chunk)) catch {};
             gpa.free(mac);
         } else |_| {}
-        off += piece.len;
-        record(io, gpa, sidecar, .download, total, effectiveChunk(opts), off, remote_path);
+        write_off += piece.len;
+        gpa.free(piece);
+        record(io, gpa, sidecar, .download, total, chunk, write_off, remote_path);
         prog.step(@intCast(piece.len));
     }
     prog.finish();

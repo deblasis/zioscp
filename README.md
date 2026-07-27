@@ -53,10 +53,9 @@ The wide-area-network speedup is measured by `tests/bench-latency.sh`, which
 runs on a Linux host with `tc netem` (it injects RTT on the loopback; the
 control session rides a different interface). Representative result at 100 ms
 RTT, 50 files: `scp -r` 28 s vs `zioscp -r -j4` 7.7 s (**3.7x faster**).
-Single-file upload also beats scp under latency (the upload pipeline keeps many
-SFTP WRITEs in flight). Download does not yet -- it is not pipelined -- so a
-single-file download under latency is slower than scp (use `-j` for parallel
-download, or wait for download pipelining).
+Single-file upload and download both beat scp under latency too, because both
+keep a large window of SFTP requests in flight (the download pipeline relies on
+ssh's internal buffering to absorb large DATA responses without a deadlock).
 
 ## Design
 

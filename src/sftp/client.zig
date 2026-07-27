@@ -202,6 +202,36 @@ pub fn Session(comptime Duplex: type) type {
             }
         }
 
+        /// Send a READ without waiting for the DATA reply (for download
+        /// pipelining). Responses come back FIFO, so a caller can drain N
+        /// replies after N sends without matching ids.
+        pub fn sendReadUnacked(self: *Self, handle: []const u8, offset: u64, len: u32) Error!void {
+            const id = self.allocId();
+            try self.send(packets.encodeRead, .{ id, handle, offset, len });
+        }
+
+        /// Receive one READ reply: owned DATA bytes, or `error.Eof` for a
+        /// past-end STATUS, or a typed error. The pipelining drain counterpart
+        /// to `sendReadUnacked`.
+        pub fn recvData(self: *Self) Error![]u8 {
+            const payload = try self.recv();
+            defer self.gpa.free(payload);
+            const h = packets.decodeHeader(payload) catch |e| return mapDecodeErr(e);
+            switch (h.type) {
+                .data => {
+                    var br = packets.BodyReader.init(h.body);
+                    const data = br.readData() catch return error.ProtocolError;
+                    return self.gpa.dupe(u8, data) catch error.OutOfMemory;
+                },
+                .status => {
+                    const code = try decodeStatus(h.body);
+                    if (code == .eof) return error.Eof;
+                    return statusToError(code);
+                },
+                else => return error.UnexpectedResponse,
+            }
+        }
+
         pub fn write(self: *Self, handle: []const u8, offset: u64, data: []const u8) Error!void {
             try self.sendWriteUnacked(handle, offset, data);
             try self.awaitAnyOk();
@@ -451,6 +481,27 @@ test "open surfaces a STATUS error as a typed error" {
     defer mock.tx.deinit(testing.allocator);
     var sess = Session(MockDuplex).init(testing.allocator, &mock);
     try testing.expectError(error.NoSuchFile, sess.open("/missing", packets.FXF_READ, Attrs.empty));
+}
+
+test "pipelined read: sendReadUnacked then recvData drains FIFO" {
+    var rx_aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer rx_aw.deinit();
+    canned(&rx_aw, packets.encodeData, .{ @as(u32, 1), "AAAA" });
+    canned(&rx_aw, packets.encodeData, .{ @as(u32, 2), "BBBB" });
+
+    var mock = MockDuplex{ .gpa = testing.allocator, .rx = rx_aw.writer.buffered() };
+    defer mock.tx.deinit(testing.allocator);
+    var sess = Session(MockDuplex).init(testing.allocator, &mock);
+
+    try sess.sendReadUnacked("H", 0, 4);
+    try sess.sendReadUnacked("H", 4, 4);
+
+    const d1 = try sess.recvData();
+    defer testing.allocator.free(d1);
+    try testing.expectEqualSlices(u8, "AAAA", d1);
+    const d2 = try sess.recvData();
+    defer testing.allocator.free(d2);
+    try testing.expectEqualSlices(u8, "BBBB", d2);
 }
 
 test "read decodes DATA and reports EOF past the end" {
