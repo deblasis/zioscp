@@ -45,9 +45,17 @@ zig build -Dbackend=libssh2     # links -lssh2 (needs libssh2 on the system)
 libssh2 provides only the SSH transport: zioscp opens a channel to the `sftp`
 subsystem and runs its existing SFTP codec over the channel bytes, so all the
 SFTP/resume/pipeline logic is shared. Single-file and recursive (`-r`)
-transfers work; parallel (`-j`) is not yet wired through this backend. Host-key
-verification and vendoring libssh2 (for a true single static binary, no system
-lib) are follow-ons.
+transfers work; parallel (`-j`) is not yet wired through this backend. It links
+the system libssh2 (vendoring libssh2+crypto for a true single static binary is
+a follow-on).
+
+Both backends verify the server host key by default, like scp/ssh under
+BatchMode: an unknown or changed key is refused. `--host-key-check` mirrors
+ssh's `StrictHostKeyChecking` (`strict` default | `accept-new` | `no`) -- the ssh
+backend passes it through as `-o StrictHostKeyChecking=...`; the libssh2 backend
+checks `~/.ssh/known_hosts` via libssh2 (plain + hashed entries and the common
+key types; ssh's `@cert-authority`/revocation/`CheckHostIP`/canonicalization are
+an acknowledged gap).
 
 ## Benchmark
 

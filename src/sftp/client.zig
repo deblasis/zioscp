@@ -21,6 +21,7 @@ pub const Error = error{
     Eof,
     NoSuchFile,
     PermissionDenied,
+    HostKeyRefused,
     Failure,
     BadMessage,
     OpUnsupported,

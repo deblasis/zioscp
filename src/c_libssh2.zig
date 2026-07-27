@@ -12,6 +12,7 @@ const std = @import("std");
 
 pub const SESSION = opaque {};
 pub const CHANNEL = opaque {};
+pub const KNOWNHOSTS = opaque {};
 
 // Raw libssh2 entry points. Many "plain" names in libssh2.h are macros that
 // map to these `_ex` symbols with extra length/stream-id params, so the extern
@@ -67,6 +68,65 @@ extern "c" fn libssh2_session_last_error(
     errmsg_len: *c_int,
     want_buf: c_int,
 ) c_int;
+extern "c" fn libssh2_session_hostkey(session: *SESSION, len: *usize, key_type: *c_int) ?[*]const u8;
+extern "c" fn libssh2_knownhost_init(session: *SESSION) ?*KNOWNHOSTS;
+extern "c" fn libssh2_knownhost_readfile(hosts: *KNOWNHOSTS, filename: [*:0]const u8, file_type: c_int) c_int;
+extern "c" fn libssh2_knownhost_checkp(
+    hosts: *KNOWNHOSTS,
+    host: [*:0]const u8,
+    port: c_int,
+    key: [*]const u8,
+    key_len: usize,
+    type_mask: c_int,
+    out: ?*?*anyopaque,
+) c_int;
+extern "c" fn libssh2_knownhost_free(hosts: *KNOWNHOSTS) void;
+
+// known_hosts constants (libssh2.h).
+const kh_type_plain: c_int = 1;
+const kh_keyenc_raw: c_int = 1 << 16;
+const kh_file_openssh: c_int = 1;
+const kh_check_match: c_int = 0;
+const kh_check_mismatch: c_int = 1;
+const kh_check_notfound: c_int = 2;
+
+/// Map a LIBSSH2_HOSTKEY_TYPE_* to the LIBSSH2_KNOWNHOST_KEY_* typemask bits.
+fn hostKeyFlag(t: c_int) c_int {
+    return switch (t) {
+        1 => 2 << 18, // RSA -> KEY_SSHRSA
+        2 => 3 << 18, // DSS -> KEY_SSHDSS
+        3 => 4 << 18, // ECDSA_256
+        4 => 5 << 18, // ECDSA_384
+        5 => 6 << 18, // ECDSA_521
+        6 => 7 << 18, // ED25519
+        else => 15 << 18, // KEY_UNKNOWN
+    };
+}
+
+pub const HostCheck = enum { match, mismatch, notfound, fail };
+
+/// Check the session's server host key against an OpenSSH known_hosts file.
+/// FAITHFULNESS NOTE: this covers plain + hashed hostname entries and the
+/// common key types. ssh's known_hosts also supports @cert-authority, key
+/// revocation, CheckHostIP, and hostname canonicalization, which libssh2's
+/// known_hosts API does not -- those edge cases are not verified here.
+pub fn checkHost(session: *SESSION, host: [:0]const u8, port: u16, known_hosts_path: [:0]const u8) HostCheck {
+    var key_len: usize = 0;
+    var key_type: c_int = 0;
+    const key = libssh2_session_hostkey(session, &key_len, &key_type) orelse return .fail;
+    const kh = libssh2_knownhost_init(session) orelse return .fail;
+    defer libssh2_knownhost_free(kh);
+    // A missing/unreadable known_hosts file -> treat as no known hosts (notfound).
+    _ = libssh2_knownhost_readfile(kh, known_hosts_path.ptr, kh_file_openssh);
+    const typemask: c_int = kh_type_plain | kh_keyenc_raw | hostKeyFlag(key_type);
+    const r = libssh2_knownhost_checkp(kh, host.ptr, port, key, key_len, typemask, null);
+    return switch (r) {
+        kh_check_match => .match,
+        kh_check_mismatch => .mismatch,
+        kh_check_notfound => .notfound,
+        else => .fail,
+    };
+}
 
 /// Last error message recorded on the session (internal pointer; do not free).
 pub fn lastError(session: *SESSION) []const u8 {

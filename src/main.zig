@@ -21,6 +21,7 @@ const Args = struct {
     bwlimit: u64 = 0,
     jobs: u32 = 1,
     verbose: bool = false,
+    host_key_check: engine.HostKeyCheck = .strict,
     files: []const []const u8 = &.{},
 
     pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p', .jobs = 'j', .verbose = 'v' };
@@ -34,6 +35,7 @@ const Args = struct {
         .bwlimit = "limit transfer to N bytes/sec (default unlimited)",
         .jobs = "parallel transfer connections for -r (default 1)",
         .verbose = "print one progress line per file to stderr",
+        .host_key_check = "server host key check: strict (default) | accept-new | no (mirrors ssh StrictHostKeyChecking)",
         .files = "src dest (one remote [user@]host:path, one local)",
     };
 };
@@ -113,6 +115,8 @@ fn transferLibssh2(
     user_host: []const u8,
     port_s: []const u8,
     identity: ?[]const u8,
+    mode: engine.HostKeyCheck,
+    known_hosts_path: []const u8,
 ) !void {
     const tl = @import("transport_libssh2.zig");
     const at = std.mem.indexOfScalar(u8, user_host, '@') orelse
@@ -121,7 +125,7 @@ fn transferLibssh2(
     const host = user_host[at + 1 ..];
     const port = std.fmt.parseInt(u16, port_s, 10) catch 22;
     const key = identity orelse bail("libssh2 backend requires -i <key>", .{});
-    var conn = tl.Connection.open(gpa, io, host, port, user, key) catch |err|
+    var conn = tl.Connection.open(gpa, io, host, port, user, key, mode, known_hosts_path) catch |err|
         bail("libssh2 connection failed: {s}", .{@errorName(err)});
     defer conn.deinit();
     transfer(gpa, io, &conn.sess, opts, download, recursive, src, dest, remote_path) catch |err|
@@ -178,6 +182,15 @@ pub fn main(init: std.process.Init) !void {
     }
     ssh_argv.append(aa, "-o") catch bail("oom", .{});
     ssh_argv.append(aa, "BatchMode=yes") catch bail("oom", .{});
+    // Host-key check mirrors scp/ssh's StrictHostKeyChecking (default strict).
+    const shk_val: []const u8 = switch (v.host_key_check) {
+        .strict => "yes",
+        .accept_new => "accept-new",
+        .no => "no",
+    };
+    const shk_opt = std.fmt.allocPrint(aa, "StrictHostKeyChecking={s}", .{shk_val}) catch bail("oom", .{});
+    ssh_argv.append(aa, "-o") catch bail("oom", .{});
+    ssh_argv.append(aa, shk_opt) catch bail("oom", .{});
     ssh_argv.append(aa, "-s") catch bail("oom", .{});
     ssh_argv.append(aa, "--") catch bail("oom", .{});
     ssh_argv.append(aa, spec.user_host) catch bail("oom", .{});
@@ -226,7 +239,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (config.backend == .libssh2) {
-        transferLibssh2(gpa, io, opts, download, v.recursive, src, dest, spec.path, spec.user_host, v.port, v.identity) catch |err|
+        const home = init.environ_map.get("HOME") orelse
+            bail("libssh2 backend needs $HOME set for ~/.ssh/known_hosts", .{});
+        const kh_path = std.fmt.allocPrint(aa, "{s}/.ssh/known_hosts", .{home}) catch bail("oom", .{});
+        transferLibssh2(gpa, io, opts, download, v.recursive, src, dest, spec.path, spec.user_host, v.port, v.identity, v.host_key_check, kh_path) catch |err|
             bail("transfer failed: {s}", .{@errorName(err)});
         return;
     }

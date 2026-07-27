@@ -32,6 +32,11 @@ pub const Options = struct {
     preserve: bool = false,
 };
 
+/// Server host-key verification policy (mirrors ssh's StrictHostKeyChecking):
+/// strict fails on unknown/changed; accept_new fails on changed but proceeds on
+/// first-seen; no skips verification. Default strict, like scp under BatchMode.
+pub const HostKeyCheck = enum { strict, accept_new, no };
+
 /// Bandwidth pacer. ziorate's TokenBucket is per-token, so we treat one token
 /// as one chunk: a bucket of capacity 1 refilling at (bwlimit / chunk) tokens
 /// per second bounds the transfer to bwlimit bytes/sec. Disabled when

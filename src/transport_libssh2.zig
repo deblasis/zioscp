@@ -12,6 +12,7 @@
 const std = @import("std");
 const client = @import("sftp/client.zig");
 const libssh2 = @import("c_libssh2.zig");
+const engine = @import("engine.zig");
 
 const Error = client.Error;
 
@@ -74,7 +75,9 @@ pub const Connection = struct {
     sess: client.Session(DuplexLibssh2),
 
     /// `key_path` is the private key; the public key is assumed alongside as
-    /// `<key_path>.pub` (matching ssh-keygen / scp -i convention).
+    /// `<key_path>.pub` (matching ssh-keygen / scp -i convention). `mode`
+    /// controls server host-key verification against `known_hosts_path` (an
+    /// OpenSSH known_hosts file); strict is the scp/BatchMode default.
     pub fn open(
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -82,6 +85,8 @@ pub const Connection = struct {
         port: u16,
         user: []const u8,
         key_path: []const u8,
+        mode: engine.HostKeyCheck,
+        known_hosts_path: []const u8,
     ) Error!Connection {
         libssh2.init() catch return error.IoClosed;
         errdefer libssh2.deinit();
@@ -95,7 +100,21 @@ pub const Connection = struct {
         libssh2.sessionSetBlocking(session, 1);
 
         libssh2.handshake(session, fd) catch return error.IoClosed;
-        errdefer libssh2.disconnect(session);
+
+        // Verify the server host key against the OpenSSH known_hosts file,
+        // scp/BatchMode-faithful: strict refuses unknown and changed keys.
+        if (mode != .no) {
+            const z_host = std.heap.page_allocator.dupeZ(u8, host) catch return error.OutOfMemory;
+            defer std.heap.page_allocator.free(z_host);
+            const z_kh = std.heap.page_allocator.dupeZ(u8, known_hosts_path) catch return error.OutOfMemory;
+            defer std.heap.page_allocator.free(z_kh);
+            switch (libssh2.checkHost(session, z_host, port, z_kh)) {
+                .match => {},
+                .mismatch => return error.HostKeyRefused, // changed key: refuse (MITM protection)
+                .notfound => if (mode == .strict) return error.HostKeyRefused,
+                .fail => return error.IoClosed,
+            }
+        }
 
         // Key auth: z-terminate user, private key, and "<key>.pub".
         const z_user = std.heap.page_allocator.dupeZ(u8, user) catch return error.OutOfMemory;
