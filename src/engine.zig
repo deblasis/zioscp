@@ -11,6 +11,7 @@ const std = @import("std");
 const client = @import("sftp/client.zig");
 const packets = @import("sftp/packets.zig");
 const resume_mod = @import("resume.zig");
+const zioprogress = @import("zioprogress");
 
 const Dir = std.Io.Dir;
 const Session = client.Session;
@@ -18,8 +19,53 @@ const Session = client.Session;
 pub const Options = struct {
     chunk_size: u32 = 8 * 1024 * 1024,
     resume_enabled: bool = true,
-    /// Apply source permissions/mtime to the destination. Not yet wired.
+    /// Render a progress bar to stderr (only when stderr is a TTY).
+    progress: bool = true,
+    /// Apply source permissions/mtime to the destination. Permission bits only.
     preserve: bool = false,
+};
+
+fn stderrIsTty(io: std.Io) bool {
+    return std.Io.File.stderr().isTty(io) catch false;
+}
+
+/// TTY-gated progress bar. Renders only when interactive (opts.progress and
+/// stderr is a TTY), so tests and pipes stay quiet. Re-renders only on a
+/// percentage change to keep large transfers from flooding stderr.
+const Progress = struct {
+    bar: zioprogress.ProgressBar,
+    last_pct: u8,
+    show: bool,
+
+    fn start(io: std.Io, label: []const u8, total: u64, opts: Options, resume_off: u64) Progress {
+        var p: Progress = .{
+            .bar = zioprogress.ProgressBar.init(.{ .prefix = label, .width = 30 }, total),
+            .last_pct = 255,
+            .show = opts.progress and stderrIsTty(io),
+        };
+        p.bar.current = resume_off;
+        return p;
+    }
+    fn step(self: *Progress, inc: u64) void {
+        if (!self.show) return;
+        self.bar.advance(inc);
+        const pct = self.bar.percent();
+        if (pct != self.last_pct) {
+            self.last_pct = pct;
+            self.render();
+        }
+    }
+    fn render(self: *Progress) void {
+        var buf: [256]u8 = undefined;
+        const s = self.bar.render(&buf);
+        std.debug.print("\r{s}", .{s});
+    }
+    fn finish(self: *Progress) void {
+        if (!self.show) return;
+        self.bar.current = self.bar.total;
+        self.render();
+        std.debug.print("\n", .{});
+    }
 };
 
 /// SFTP v3 guarantees servers can process packets with at least ~34000 bytes
@@ -109,13 +155,16 @@ pub fn uploadFile(
     const buf = try gpa.alloc(u8, effectiveChunk(opts));
     defer gpa.free(buf);
     var off = next_off;
+    var prog = Progress.start(io, remote_path, total, opts, next_off);
     while (off < total) {
         const len: usize = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
         _ = try local.readPositionalAll(io, buf[0..len], off);
         try sess.write(handle, off, buf[0..len]);
         off += len;
         record(io, gpa, sidecar, .upload, total, effectiveChunk(opts), off, local_path);
+        prog.step(len);
     }
+    prog.finish();
     if (opts.preserve) {
         // Permission bits only (mtime preservation needs a Timestamp->seconds
         // conversion; deferred). Best-effort: ignore if the server refuses.
@@ -156,6 +205,7 @@ pub fn downloadFile(
     const buf = try gpa.alloc(u8, effectiveChunk(opts));
     defer gpa.free(buf);
     var off = next_off;
+    var prog = Progress.start(io, local_path, total, opts, next_off);
     while (off < total) {
         const want: u32 = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
         const piece = sess.read(rh, off, want) catch |err| switch (err) {
@@ -167,7 +217,9 @@ pub fn downloadFile(
         try local.writePositionalAll(io, piece, off);
         off += piece.len;
         record(io, gpa, sidecar, .download, total, effectiveChunk(opts), off, remote_path);
+        prog.step(@intCast(piece.len));
     }
+    prog.finish();
     try sess.close(rh);
     resume_mod.removeFile(io, sidecar);
 }

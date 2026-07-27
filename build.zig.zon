@@ -12,6 +12,10 @@
             .url = "https://github.com/deblasis/ziojson/archive/refs/tags/v0.4.0.tar.gz",
             .hash = "ziojson-0.4.0-5G9pUqaWAAC6IaIjmCuJtbqn4Glrlxkg2jF1bTzzROif",
         },
+        .zioprogress = .{
+            .url = "https://github.com/deblasis/zioprogress/archive/refs/heads/master.tar.gz",
+            .hash = "zioprogress-0.1.0-KCfsjP00AAAl6YQOhdamuchhlUTwJwmLOpRxtgM4hI8d",
+        },
     },
     .paths = .{
         "build.zig",
