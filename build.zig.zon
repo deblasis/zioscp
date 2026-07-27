@@ -21,8 +21,8 @@
             .hash = "ziorate-0.2.0-ZNPvJ_E4AAC8qiycrfhyjpZqmtg12HbCSLSi5m5AIdpJ",
         },
         .zioarg = .{
-            .url = "https://github.com/deblasis/zioarg/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "zioarg-0.1.0-5X0P9cMDAQAHb7lYFaDlh9wkzjOckB5bkez0ZYl7LBzP",
+            .url = "https://github.com/deblasis/zioarg/archive/refs/heads/main.tar.gz",
+            .hash = "zioarg-0.1.0-5X0P9YUGAQDNNhINQOXmfIsgmnzZ9-Sn0KUZ8u8ZGleb",
         },
     },
     .paths = .{
