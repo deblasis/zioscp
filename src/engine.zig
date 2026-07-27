@@ -116,6 +116,12 @@ pub fn uploadFile(
         off += len;
         record(io, gpa, sidecar, .upload, total, effectiveChunk(opts), off, local_path);
     }
+    if (opts.preserve) {
+        // Permission bits only (mtime preservation needs a Timestamp->seconds
+        // conversion; deferred). Best-effort: ignore if the server refuses.
+        const mode = st.permissions.toMode();
+        sess.fsetstat(handle, .{ .flags = packets.ATTR_PERMISSIONS, .permissions = @intCast(mode & 0o7777) }) catch {};
+    }
     try sess.close(handle);
     resume_mod.removeFile(io, sidecar);
 }

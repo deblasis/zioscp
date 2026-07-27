@@ -25,6 +25,7 @@ const usage =
     \\  -P PORT          ssh port (default 22)
     \\  -i KEY           identity file
     \\  -r               copy directories recursively
+    \\  -p               preserve file permissions
     \\  --chunk-size N   transfer chunk size in bytes (default 8 MiB)
     \\  --no-resume      overwrite from the start instead of resuming
     \\  -h, --help       show this help
@@ -61,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     var chunk_size: u32 = 8 * 1024 * 1024;
     var resume_enabled = true;
     var recursive = false;
+    var preserve = false;
     var positionals: [2][]const u8 = .{ "", "" };
     var npos: usize = 0;
 
@@ -82,6 +84,8 @@ pub fn main(init: std.process.Init) !void {
             resume_enabled = false;
         } else if (std.mem.eql(u8, a, "-r")) {
             recursive = true;
+        } else if (std.mem.eql(u8, a, "-p")) {
+            preserve = true;
         } else if (std.mem.eql(u8, a, "--chunk-size")) {
             i += 1;
             if (i >= args.len) bail("{s}", .{usage});
@@ -127,7 +131,7 @@ pub fn main(init: std.process.Init) !void {
     ssh_argv.append(aa, spec.user_host) catch bail("oom", .{});
     ssh_argv.append(aa, "sftp") catch bail("oom", .{});
 
-    const opts: engine.Options = .{ .chunk_size = chunk_size, .resume_enabled = resume_enabled };
+    const opts: engine.Options = .{ .chunk_size = chunk_size, .resume_enabled = resume_enabled, .preserve = preserve };
 
     var conn = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
         bail("connection failed: {s}", .{@errorName(err)});
