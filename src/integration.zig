@@ -121,7 +121,7 @@ test "integration: engine upload+download round-trip is byte-identical" {
     try testing.expect((cwd.statFile(io, sidecar, .{}) catch null) == null); // sidecar removed
     try engine.downloadFile(testing.allocator, io, &conn.sess, remote, pulled, .{ .chunk_size = 8192 });
 
-    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
     defer testing.allocator.free(got);
     try testing.expectEqual(n, got.len);
     try testing.expectEqualSlices(u8, payload, got);
@@ -178,7 +178,7 @@ test "integration: engine upload resumes after a partial transfer" {
 
     // Pull it back and confirm the whole file is correct.
     try engine.downloadFile(testing.allocator, io, &conn.sess, remote, pulled, .{ .chunk_size = 8192 });
-    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
     defer testing.allocator.free(got);
     try testing.expectEqual(n, got.len);
     try testing.expectEqualSlices(u8, payload, got);
@@ -292,7 +292,7 @@ test "integration: P3 single-file chunked parallel is byte-identical" {
     try engine.uploadFileParallel(testing.allocator, &argv, local, remote, .{ .chunk_size = 8192 }, 4);
     try engine.downloadFileParallel(testing.allocator, &argv, remote, pulled, .{ .chunk_size = 8192 }, 4);
 
-    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
     defer testing.allocator.free(got);
     try testing.expectEqual(n, got.len);
     try testing.expectEqualSlices(u8, payload, got);
@@ -747,11 +747,11 @@ test "battle: connection drop mid-upload surfaces an error and leaves a resumabl
     defer cwd.deleteFile(io, sidecar) catch {};
     defer cwd.deleteFile(io, pulled) catch {};
 
-    // 2 MiB paced at 512 KiB/s ~= 4 s total. The pipelined uploader does not
-    // ACK its first chunk until the 16-deep window fills (~window * interval),
-    // so the kill must land comfortably past that and well before completion:
-    // ~0.25 s to first ACK, kill at ~1.5 s, ~4 s to finish.
-    const n: usize = 2 * 1024 * 1024;
+    // 32 MiB paced at 4 MiB/s ~= 8 s total. The file is larger than one pipeline
+    // window (256 * 32 KiB = 8 MiB) so ACKs flow mid-transfer. The kill lands
+    // after the first ACK (polled via the sidecar) so the drop is genuinely
+    // mid-transfer and leaves resumable state, regardless of the window size.
+    const n: usize = 32 * 1024 * 1024;
     const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
     defer testing.allocator.free(payload);
     for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
@@ -763,17 +763,24 @@ test "battle: connection drop mid-upload surfaces an error and leaves a resumabl
         .argv = &argv,
         .local = local,
         .remote = remote,
-        .opts = .{ .chunk_size = 8192, .bwlimit_bps = 512 * 1024 },
+        .opts = .{ .chunk_size = 8192, .bwlimit_bps = 4 * 1024 * 1024 },
         .pid = std.atomic.Value(std.posix.pid_t).init(-1),
     };
     const thread = std.Thread.spawn(.{}, dropUpload, .{&ctx}) catch return error.OutOfMemory;
 
-    // Wait for the worker to connect (pid published), then let it transfer.
+    // Wait for the worker to connect (pid published).
     var spin: usize = 0;
     while (ctx.pid.load(.acquire) < 0 and spin < 3000) : (spin += 1) {
         std.Io.sleep(io, .{ .nanoseconds = 1_000_000 }, .awake) catch {};
     }
-    std.Io.sleep(io, .{ .nanoseconds = 1_500_000_000 }, .awake) catch {};
+    // Wait until at least one chunk is ACKed (sidecar appears), so the drop is
+    // mid-transfer with resumable state. Polling decouples this from the
+    // pipeline window size (the first ACK only happens once the window fills).
+    var wait: usize = 0;
+    while ((cwd.statFile(io, sidecar, .{}) catch null) == null and wait < 6000) : (wait += 1) {
+        std.Io.sleep(io, .{ .nanoseconds = 1_000_000 }, .awake) catch {};
+    }
+    std.Io.sleep(io, .{ .nanoseconds = 500_000_000 }, .awake) catch {};
     // Drop the connection hard.
     const pid = ctx.pid.load(.acquire);
     if (pid > 0) std.posix.kill(pid, std.posix.SIG.KILL) catch {};
@@ -791,7 +798,7 @@ test "battle: connection drop mid-upload surfaces an error and leaves a resumabl
     defer conn.sess.remove(remote) catch {};
     try engine.uploadFile(testing.allocator, io, &conn.sess, local, remote, .{ .chunk_size = 8192, .resume_enabled = true });
     try engine.downloadFile(testing.allocator, io, &conn.sess, remote, pulled, .{ .chunk_size = 8192 });
-    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(u8, payload, got);
 }

@@ -210,9 +210,13 @@ pub fn uploadFile(
     // Sliding-window pipeline: keep up to `window` WRITEs in flight. SFTP
     // processes FIFO and STATUS replies are tiny, so a single-threaded fill/
     // drain keeps the server's write path saturated with no pipe-buffer
-    // deadlock risk (the benchmark showed serialization was zioscp-j1's main
-    // overhead vs scp). Sidecar records the byte offset of acknowledged writes.
-    const window: usize = 16;
+    // deadlock risk. The window sets the in-flight bytes (window * chunk) and
+    // thus the bandwidth-delay product the single stream can cover: at 16 it
+    // capped throughput on high-RTT links (the latency benchmark on ubuntinovm
+    // showed zioscp-j1 losing to scp at 100ms RTT). 256 * 32 KiB = 8 MiB covers
+    // ~80 MB/s at 100ms RTT, comfortably past scp, at no extra client memory
+    // (one reused buf). Sidecar records the byte offset of acknowledged writes.
+    const window: usize = 256;
     var off = next_off;
     var in_flight: usize = 0;
     var acked_writes: u64 = if (chunk > 0) next_off / @as(u64, chunk) else 0;
@@ -397,7 +401,11 @@ pub fn collectUploadTasks(
     out: *std.ArrayList(Task),
 ) !void {
     remoteMkdir(sess, remote_dir);
-    var dir = Dir.cwd().openDir(io, local_dir, .{}) catch |err| {
+    // iterate = true is required to read entries (Zig 0.16 opens dirs without
+    // it in a mode that cannot be iterated; on Linux .iterate() then panics
+    // with EBADF in posixSeekTo/dirReadLinux). Mac tolerates the default, so
+    // this only shows up on the linux target.
+    var dir = Dir.cwd().openDir(io, local_dir, .{ .iterate = true }) catch |err| {
         std.debug.print("zioscp: cannot open dir {s}: {s}\n", .{ local_dir, @errorName(err) });
         return err;
     };
