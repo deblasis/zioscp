@@ -3,3 +3,5 @@ zig-out/
 .DS_Store
 tests/keys/
 zig-pkg/
+zioscp_*
+*.zioscppart

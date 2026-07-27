@@ -182,3 +182,43 @@ test "integration: engine upload resumes after a partial transfer" {
     try testing.expectEqual(n, got.len);
     try testing.expectEqualSlices(u8, payload, got);
 }
+
+test "integration: engine recursive upload/download preserves a tree" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const src_dir = "zioscp_tree_src";
+    const dst_dir = "zioscp_tree_dst";
+    const remote_dir = "/config/zioscp_tree";
+    defer cwd.deleteTree(io, src_dir) catch {};
+    defer cwd.deleteTree(io, dst_dir) catch {};
+
+    // Build a known tree: src/a.txt and src/sub/b.bin.
+    try cwd.createDirPath(io, "zioscp_tree_src/sub");
+    const a = [_]u8{ 'a', 'a', 'a', 'x' };
+    const b = [_]u8{ 'b', '_', '0', '1', '2', '3' };
+    try cwd.writeFile(io, .{ .sub_path = "zioscp_tree_src/a.txt", .data = &a });
+    try cwd.writeFile(io, .{ .sub_path = "zioscp_tree_src/sub/b.bin", .data = &b });
+
+    try engine.uploadDir(testing.allocator, io, &conn.sess, src_dir, remote_dir, .{ .chunk_size = 8192 });
+    try testing.expect(remoteIsDir(&conn.sess, remote_dir));
+
+    try engine.downloadDir(testing.allocator, io, &conn.sess, remote_dir, dst_dir, .{ .chunk_size = 8192 });
+
+    const ga = cwd.readFileAlloc(io, "zioscp_tree_dst/a.txt", testing.allocator, .limited(1 << 20)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(ga);
+    try testing.expectEqualSlices(u8, &a, ga);
+
+    const gb = cwd.readFileAlloc(io, "zioscp_tree_dst/sub/b.bin", testing.allocator, .limited(1 << 20)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(gb);
+    try testing.expectEqualSlices(u8, &b, gb);
+}
+
+fn remoteIsDir(sess: anytype, path: []const u8) bool {
+    const x = sess.stat(path) catch return false;
+    return (x.flags & packets.ATTR_PERMISSIONS != 0) and ((x.permissions & 0o170000) == 0o040000);
+}

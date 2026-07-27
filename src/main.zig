@@ -6,6 +6,12 @@
 const std = @import("std");
 const transport = @import("transport.zig");
 const engine = @import("engine.zig");
+const packets = @import("sftp/packets.zig");
+
+fn isLocalDir(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .directory;
+}
 
 const usage =
     \\zioscp - drop-in scp over SFTP, with resume
@@ -18,6 +24,7 @@ const usage =
     \\Options:
     \\  -P PORT          ssh port (default 22)
     \\  -i KEY           identity file
+    \\  -r               copy directories recursively
     \\  --chunk-size N   transfer chunk size in bytes (default 8 MiB)
     \\  --no-resume      overwrite from the start instead of resuming
     \\  -h, --help       show this help
@@ -53,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
     var identity: ?[]const u8 = null;
     var chunk_size: u32 = 8 * 1024 * 1024;
     var resume_enabled = true;
+    var recursive = false;
     var positionals: [2][]const u8 = .{ "", "" };
     var npos: usize = 0;
 
@@ -72,6 +80,8 @@ pub fn main(init: std.process.Init) !void {
             identity = args[i];
         } else if (std.mem.eql(u8, a, "--no-resume")) {
             resume_enabled = false;
+        } else if (std.mem.eql(u8, a, "-r")) {
+            recursive = true;
         } else if (std.mem.eql(u8, a, "--chunk-size")) {
             i += 1;
             if (i >= args.len) bail("{s}", .{usage});
@@ -124,10 +134,26 @@ pub fn main(init: std.process.Init) !void {
     defer conn.deinit();
 
     if (download) {
-        engine.downloadFile(gpa, io, &conn.sess, spec.path, dest, opts) catch |err|
-            bail("download failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
+        if (recursive and remoteIsDir(&conn.sess, spec.path)) {
+            engine.downloadDir(gpa, io, &conn.sess, spec.path, dest, opts) catch |err|
+                bail("download failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
+        } else {
+            engine.downloadFile(gpa, io, &conn.sess, spec.path, dest, opts) catch |err|
+                bail("download failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
+        }
     } else {
-        engine.uploadFile(gpa, io, &conn.sess, src, spec.path, opts) catch |err|
-            bail("upload failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
+        if (recursive and isLocalDir(io, src)) {
+            engine.uploadDir(gpa, io, &conn.sess, src, spec.path, opts) catch |err|
+                bail("upload failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
+        } else {
+            engine.uploadFile(gpa, io, &conn.sess, src, spec.path, opts) catch |err|
+                bail("upload failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
+        }
     }
+}
+
+fn remoteIsDir(sess: anytype, path: []const u8) bool {
+    const a = sess.stat(path) catch return false;
+    return (a.flags & packets.ATTR_PERMISSIONS != 0) and
+        ((a.permissions & 0o170000) == 0o040000);
 }

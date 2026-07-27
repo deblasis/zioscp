@@ -165,3 +165,95 @@ pub fn downloadFile(
     try sess.close(rh);
     resume_mod.removeFile(io, sidecar);
 }
+
+fn remoteMkdir(sess: anytype, path: []const u8) void {
+    // Ignore "already exists" so resuming a tree transfer is idempotent.
+    sess.mkdir(path, packets.Attrs.empty) catch {};
+}
+
+/// Upload a local directory tree to a remote directory (created if missing).
+/// Symlinks and special files are skipped. `-r`.
+pub fn uploadDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    sess: anytype,
+    local_dir: []const u8,
+    remote_dir: []const u8,
+    opts: Options,
+) !void {
+    remoteMkdir(sess, remote_dir);
+
+    var dir = Dir.cwd().openDir(io, local_dir, .{}) catch |err| {
+        std.debug.print("zioscp: cannot open dir {s}: {s}\n", .{ local_dir, @errorName(err) });
+        return err;
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        switch (entry.kind) {
+            .file => {
+                const child_local = try std.fs.path.join(gpa, &.{ local_dir, entry.name });
+                defer gpa.free(child_local);
+                const child_remote = try std.fs.path.join(gpa, &.{ remote_dir, entry.name });
+                defer gpa.free(child_remote);
+                uploadFile(gpa, io, sess, child_local, child_remote, opts) catch |err| {
+                    std.debug.print("zioscp: skipping {s}: {s}\n", .{ child_local, @errorName(err) });
+                };
+            },
+            .directory => {
+                const child_local = try std.fs.path.join(gpa, &.{ local_dir, entry.name });
+                defer gpa.free(child_local);
+                const child_remote = try std.fs.path.join(gpa, &.{ remote_dir, entry.name });
+                defer gpa.free(child_remote);
+                try uploadDir(gpa, io, sess, child_local, child_remote, opts);
+            },
+            else => {}, // skip symlinks and special files
+        }
+    }
+}
+
+/// Download a remote directory tree to a local directory (created if missing).
+/// Symlinks and special files are skipped. `-r`.
+pub fn downloadDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    sess: anytype,
+    remote_dir: []const u8,
+    local_dir: []const u8,
+    opts: Options,
+) !void {
+    Dir.cwd().createDirPath(io, local_dir) catch {};
+
+    const dh = try sess.opendir(remote_dir);
+    defer gpa.free(dh);
+    while (true) {
+        const entries = sess.readdir(dh) catch |err| switch (err) {
+            error.Eof => break,
+            else => return err,
+        };
+        defer {
+            for (entries) |e| {
+                gpa.free(e.filename);
+                gpa.free(e.longname);
+            }
+            gpa.free(entries);
+        }
+        for (entries) |e| {
+            if (std.mem.eql(u8, e.filename, ".") or std.mem.eql(u8, e.filename, "..")) continue;
+            const is_dir = (e.attrs.flags & packets.ATTR_PERMISSIONS != 0) and
+                ((e.attrs.permissions & 0o170000) == 0o040000);
+            const child_remote = try std.fs.path.join(gpa, &.{ remote_dir, e.filename });
+            defer gpa.free(child_remote);
+            const child_local = try std.fs.path.join(gpa, &.{ local_dir, e.filename });
+            defer gpa.free(child_local);
+            if (is_dir) {
+                try downloadDir(gpa, io, sess, child_remote, child_local, opts);
+            } else {
+                downloadFile(gpa, io, sess, child_remote, child_local, opts) catch |err| {
+                    std.debug.print("zioscp: skipping {s}: {s}\n", .{ child_remote, @errorName(err) });
+                };
+            }
+        }
+    }
+    try sess.close(dh);
+}
