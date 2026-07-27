@@ -18,9 +18,10 @@ const Args = struct {
     no_resume: bool = false,
     chunk_size: u32 = 8 * 1024 * 1024,
     bwlimit: u64 = 0,
+    jobs: u32 = 1,
     files: []const []const u8 = &.{},
 
-    pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p' };
+    pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p', .jobs = 'j' };
     pub const help = .{
         .port = "ssh port (default 22)",
         .identity = "identity file",
@@ -29,6 +30,7 @@ const Args = struct {
         .no_resume = "overwrite from the start instead of resuming",
         .chunk_size = "transfer chunk size in bytes (default 8 MiB)",
         .bwlimit = "limit transfer to N bytes/sec (default unlimited)",
+        .jobs = "parallel transfer connections for -r (default 1)",
         .files = "src dest (one remote [user@]host:path, one local)",
     };
 };
@@ -128,6 +130,24 @@ pub fn main(init: std.process.Init) !void {
         .preserve = v.preserve,
         .bwlimit_bps = v.bwlimit,
     };
+
+    // Parallel directory transfer: collect the file list on one connection
+    // (also pre-creating dirs), then fan out across `jobs` connections.
+    if (v.recursive and v.jobs > 1) {
+        var coll = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
+            bail("connection failed: {s}", .{@errorName(err)});
+        var list: std.ArrayList(engine.Task) = .empty;
+        if (download)
+            engine.collectDownloadTasks(aa, io, &coll.sess, spec.path, dest, &list) catch |err|
+                bail("collect failed: {s}", .{@errorName(err)})
+        else
+            engine.collectUploadTasks(aa, io, &coll.sess, src, spec.path, &list) catch |err|
+                bail("collect failed: {s}", .{@errorName(err)});
+        coll.deinit();
+        engine.runParallel(gpa, ssh_argv.items, list.items, opts, v.jobs) catch |err|
+            bail("parallel transfer failed: {s}", .{@errorName(err)});
+        return;
+    }
 
     var conn = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
         bail("connection failed: {s}", .{@errorName(err)});

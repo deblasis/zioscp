@@ -222,3 +222,48 @@ fn remoteIsDir(sess: anytype, path: []const u8) bool {
     const x = sess.stat(path) catch return false;
     return (x.flags & packets.ATTR_PERMISSIONS != 0) and ((x.permissions & 0o170000) == 0o040000);
 }
+
+test "integration: parallel (-j) upload then download round-trips a tree" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+    const src = "zioscp_par_src";
+    const dst = "zioscp_par_dst";
+    const remote = "/config/zioscp_par";
+    defer cwd.deleteTree(io, src) catch {};
+    defer cwd.deleteTree(io, dst) catch {};
+
+    const a = [_]u8{ 'p', 'a', 'r', 'a', 'l', 'l', 'e', 'l' };
+    const b = [_]u8{ 's', 'u', 'b', '_', 'f', 'i', 'l', 'e', '!', '!' };
+    try cwd.createDirPath(io, "zioscp_par_src/sub");
+    try cwd.writeFile(io, .{ .sub_path = "zioscp_par_src/a.bin", .data = &a });
+    try cwd.writeFile(io, .{ .sub_path = "zioscp_par_src/sub/b.bin", .data = &b });
+
+    const argv = sshArgv();
+
+    // Collect + parallel upload.
+    var coll = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    var up: std.ArrayList(engine.Task) = .empty;
+    defer engine.freeTasks(testing.allocator, &up);
+    try engine.collectUploadTasks(testing.allocator, io, &coll.sess, src, remote, &up);
+    coll.deinit();
+    try testing.expectEqual(@as(usize, 2), up.items.len);
+    try engine.runParallel(testing.allocator, &argv, up.items, .{ .chunk_size = 8192 }, 4);
+
+    // Collect + parallel download.
+    var coll2 = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    var dn: std.ArrayList(engine.Task) = .empty;
+    defer engine.freeTasks(testing.allocator, &dn);
+    try engine.collectDownloadTasks(testing.allocator, io, &coll2.sess, remote, dst, &dn);
+    coll2.deinit();
+    try engine.runParallel(testing.allocator, &argv, dn.items, .{ .chunk_size = 8192 }, 4);
+
+    const ga = cwd.readFileAlloc(io, "zioscp_par_dst/a.bin", testing.allocator, .limited(1 << 20)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(ga);
+    try testing.expectEqualSlices(u8, &a, ga);
+    const gb = cwd.readFileAlloc(io, "zioscp_par_dst/sub/b.bin", testing.allocator, .limited(1 << 20)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(gb);
+    try testing.expectEqualSlices(u8, &b, gb);
+}

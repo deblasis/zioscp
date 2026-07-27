@@ -13,6 +13,7 @@ const packets = @import("sftp/packets.zig");
 const resume_mod = @import("resume.zig");
 const zioprogress = @import("zioprogress");
 const ziorate = @import("ziorate");
+const transport = @import("transport.zig");
 
 const Dir = std.Io.Dir;
 const Session = client.Session;
@@ -276,18 +277,34 @@ fn remoteMkdir(sess: anytype, path: []const u8) void {
     sess.mkdir(path, packets.Attrs.empty) catch {};
 }
 
-/// Upload a local directory tree to a remote directory (created if missing).
-/// Symlinks and special files are skipped. `-r`.
-pub fn uploadDir(
+/// A single file transfer to perform. Owns its path strings, freed via the
+/// task list. Drives both sequential and parallel directory transfer.
+pub const Task = struct {
+    direction: resume_mod.Direction,
+    local: []const u8,
+    remote: []const u8,
+};
+
+pub fn freeTasks(gpa: std.mem.Allocator, list: *std.ArrayList(Task)) void {
+    for (list.items) |t| {
+        gpa.free(t.local);
+        gpa.free(t.remote);
+    }
+    list.deinit(gpa);
+}
+
+/// Walk a local tree (mkdir-ing remote dirs as it goes) and collect one Task
+/// per file into `out`. Skips symlinks and special files. Tasks own their
+/// path strings; the caller owns and frees `out`.
+pub fn collectUploadTasks(
     gpa: std.mem.Allocator,
     io: std.Io,
     sess: anytype,
     local_dir: []const u8,
     remote_dir: []const u8,
-    opts: Options,
+    out: *std.ArrayList(Task),
 ) !void {
     remoteMkdir(sess, remote_dir);
-
     var dir = Dir.cwd().openDir(io, local_dir, .{}) catch |err| {
         std.debug.print("zioscp: cannot open dir {s}: {s}\n", .{ local_dir, @errorName(err) });
         return err;
@@ -297,38 +314,35 @@ pub fn uploadDir(
     while (try it.next(io)) |entry| {
         switch (entry.kind) {
             .file => {
-                const child_local = try std.fs.path.join(gpa, &.{ local_dir, entry.name });
-                defer gpa.free(child_local);
-                const child_remote = try std.fs.path.join(gpa, &.{ remote_dir, entry.name });
-                defer gpa.free(child_remote);
-                uploadFile(gpa, io, sess, child_local, child_remote, opts) catch |err| {
-                    std.debug.print("zioscp: skipping {s}: {s}\n", .{ child_local, @errorName(err) });
-                };
+                const cl = try std.fs.path.join(gpa, &.{ local_dir, entry.name });
+                const cr = try std.fs.path.join(gpa, &.{ remote_dir, entry.name });
+                errdefer gpa.free(cl);
+                errdefer gpa.free(cr);
+                try out.append(gpa, .{ .direction = .upload, .local = cl, .remote = cr });
             },
             .directory => {
-                const child_local = try std.fs.path.join(gpa, &.{ local_dir, entry.name });
-                defer gpa.free(child_local);
-                const child_remote = try std.fs.path.join(gpa, &.{ remote_dir, entry.name });
-                defer gpa.free(child_remote);
-                try uploadDir(gpa, io, sess, child_local, child_remote, opts);
+                const cl = try std.fs.path.join(gpa, &.{ local_dir, entry.name });
+                defer gpa.free(cl);
+                const cr = try std.fs.path.join(gpa, &.{ remote_dir, entry.name });
+                defer gpa.free(cr);
+                try collectUploadTasks(gpa, io, sess, cl, cr, out);
             },
             else => {}, // skip symlinks and special files
         }
     }
 }
 
-/// Download a remote directory tree to a local directory (created if missing).
-/// Symlinks and special files are skipped. `-r`.
-pub fn downloadDir(
+/// Walk a remote tree (mkdir-ing local dirs as it goes) and collect one Task
+/// per file into `out`. Skips symlinks and special files.
+pub fn collectDownloadTasks(
     gpa: std.mem.Allocator,
     io: std.Io,
     sess: anytype,
     remote_dir: []const u8,
     local_dir: []const u8,
-    opts: Options,
+    out: *std.ArrayList(Task),
 ) !void {
     Dir.cwd().createDirPath(io, local_dir) catch {};
-
     const dh = try sess.opendir(remote_dir);
     defer gpa.free(dh);
     while (true) {
@@ -347,18 +361,129 @@ pub fn downloadDir(
             if (std.mem.eql(u8, e.filename, ".") or std.mem.eql(u8, e.filename, "..")) continue;
             const is_dir = (e.attrs.flags & packets.ATTR_PERMISSIONS != 0) and
                 ((e.attrs.permissions & 0o170000) == 0o040000);
-            const child_remote = try std.fs.path.join(gpa, &.{ remote_dir, e.filename });
-            defer gpa.free(child_remote);
-            const child_local = try std.fs.path.join(gpa, &.{ local_dir, e.filename });
-            defer gpa.free(child_local);
+            const cr = try std.fs.path.join(gpa, &.{ remote_dir, e.filename });
+            const cl = try std.fs.path.join(gpa, &.{ local_dir, e.filename });
             if (is_dir) {
-                try downloadDir(gpa, io, sess, child_remote, child_local, opts);
+                defer gpa.free(cr);
+                defer gpa.free(cl);
+                try collectDownloadTasks(gpa, io, sess, cr, cl, out);
             } else {
-                downloadFile(gpa, io, sess, child_remote, child_local, opts) catch |err| {
-                    std.debug.print("zioscp: skipping {s}: {s}\n", .{ child_remote, @errorName(err) });
-                };
+                errdefer gpa.free(cr);
+                errdefer gpa.free(cl);
+                try out.append(gpa, .{ .direction = .download, .local = cl, .remote = cr });
             }
         }
     }
     try sess.close(dh);
+}
+
+/// Upload a local directory tree to a remote directory (created if missing).
+/// Symlinks and special files are skipped. `-r`. Sequential (single stream);
+/// use the parallel runner for `-j N > 1`.
+pub fn uploadDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    sess: anytype,
+    local_dir: []const u8,
+    remote_dir: []const u8,
+    opts: Options,
+) !void {
+    var list: std.ArrayList(Task) = .empty;
+    defer freeTasks(gpa, &list);
+    try collectUploadTasks(gpa, io, sess, local_dir, remote_dir, &list);
+    for (list.items) |t| {
+        uploadFile(gpa, io, sess, t.local, t.remote, opts) catch |err| {
+            std.debug.print("zioscp: skipping {s}: {s}\n", .{ t.local, @errorName(err) });
+        };
+    }
+}
+
+/// Download a remote directory tree to a local directory (created if missing).
+/// Symlinks and special files are skipped. `-r`. Sequential; use the parallel
+/// runner for `-j N > 1`.
+pub fn downloadDir(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    sess: anytype,
+    remote_dir: []const u8,
+    local_dir: []const u8,
+    opts: Options,
+) !void {
+    var list: std.ArrayList(Task) = .empty;
+    defer freeTasks(gpa, &list);
+    try collectDownloadTasks(gpa, io, sess, remote_dir, local_dir, &list);
+    for (list.items) |t| {
+        downloadFile(gpa, io, sess, t.remote, t.local, opts) catch |err| {
+            std.debug.print("zioscp: skipping {s}: {s}\n", .{ t.remote, @errorName(err) });
+        };
+    }
+}
+
+const ParallelCtx = struct {
+    gpa: std.mem.Allocator,
+    ssh_argv: []const []const u8,
+    opts: Options,
+    tasks: []const Task,
+    next: std.atomic.Value(usize),
+    errors: std.atomic.Value(u32),
+};
+
+/// Worker thread body: its own Threaded io + ssh Connection, pulls tasks by
+/// atomic index until none remain. A per-file error is logged + counted, not
+/// fatal (the remaining tasks still run on other workers).
+fn parallelWorker(ctx: *ParallelCtx) void {
+    var threaded = std.Io.Threaded.init(ctx.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = transport.Connection.open(ctx.gpa, io, ctx.ssh_argv) catch return;
+    defer conn.deinit();
+    while (true) {
+        const idx = ctx.next.fetchAdd(1, .monotonic);
+        if (idx >= ctx.tasks.len) break;
+        const t = ctx.tasks[idx];
+        switch (t.direction) {
+            .upload => uploadFile(ctx.gpa, io, &conn.sess, t.local, t.remote, ctx.opts) catch |err| {
+                std.debug.print("zioscp: skipping {s}: {s}\n", .{ t.local, @errorName(err) });
+                _ = ctx.errors.fetchAdd(1, .monotonic);
+            },
+            .download => downloadFile(ctx.gpa, io, &conn.sess, t.remote, t.local, ctx.opts) catch |err| {
+                std.debug.print("zioscp: skipping {s}: {s}\n", .{ t.remote, @errorName(err) });
+                _ = ctx.errors.fetchAdd(1, .monotonic);
+            },
+        }
+    }
+}
+
+/// Run a batch of file tasks across `jobs` worker threads, each with its own
+/// ssh subprocess + session (so up to `jobs` files transfer concurrently).
+/// Tasks are distributed lock-free via an atomic index. Progress bars are
+/// disabled (K interleaving bars would be garbage); parallel mode is quiet.
+pub fn runParallel(
+    gpa: std.mem.Allocator,
+    ssh_argv: []const []const u8,
+    tasks: []const Task,
+    opts: Options,
+    jobs: u32,
+) !void {
+    if (tasks.len == 0) return;
+    var quiet_opts = opts;
+    quiet_opts.progress = false;
+    var ctx: ParallelCtx = .{
+        .gpa = gpa,
+        .ssh_argv = ssh_argv,
+        .opts = quiet_opts,
+        .tasks = tasks,
+        .next = std.atomic.Value(usize).init(0),
+        .errors = std.atomic.Value(u32).init(0),
+    };
+    const j: usize = @min(@as(usize, @intCast(jobs)), tasks.len);
+    const threads = try gpa.alloc(std.Thread, j);
+    defer gpa.free(threads);
+    for (0..j) |i| {
+        threads[i] = std.Thread.spawn(.{}, parallelWorker, .{&ctx}) catch |err| {
+            for (threads[0..i]) |t| t.join();
+            return err;
+        };
+    }
+    for (threads) |t| t.join();
 }
