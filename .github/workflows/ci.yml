@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: fmt
+        run: zig fmt --check src/ build.zig
+      - name: build
+        run: zig build
+      - name: unit tests
+        run: zig build test
+      - name: cross-compile x86_64-linux-gnu
+        run: zig build -Dtarget=x86_64-linux-gnu
+      # The SFTP integration tests (zig build integration) need a Docker
+      # openssh-server harness; run them locally via tests/sftp-integration.sh.

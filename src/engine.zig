@@ -26,6 +26,8 @@ pub const Options = struct {
     progress: bool = true,
     /// Max bytes/sec (0 = unlimited). Paced at chunk granularity via ziorate.
     bwlimit_bps: u64 = 0,
+    /// Print transfer progress lines to stderr (one per file).
+    verbose: bool = false,
     /// Apply source permissions/mtime to the destination. Permission bits only.
     preserve: bool = false,
 };
@@ -168,6 +170,10 @@ fn record(io: std.Io, gpa: std.mem.Allocator, sidecar: []const u8, dir: resume_m
     }) catch {};
 }
 
+fn vlog(opts: Options, comptime fmt: []const u8, args: anytype) void {
+    if (opts.verbose) std.debug.print(fmt ++ "\n", args);
+}
+
 pub fn uploadFile(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -179,6 +185,7 @@ pub fn uploadFile(
     const cwd = Dir.cwd();
     const st = try cwd.statFile(io, local_path, .{});
     const total: u64 = st.size;
+    vlog(opts, "upload {s} -> {s} ({d} bytes)", .{ local_path, remote_path, total });
 
     const sidecar = try resume_mod.sidecarPath(gpa, local_path);
     defer gpa.free(sidecar);
@@ -229,10 +236,20 @@ pub fn uploadFile(
     }
     prog.finish();
     if (opts.preserve) {
-        // Permission bits only (mtime preservation needs a Timestamp->seconds
-        // conversion; deferred). Best-effort: ignore if the server refuses.
+        // Permission bits + atime/mtime (SFTP ACMODTIME is u32 seconds). The
+        // local Stat's Timestamps are ns since epoch. Best-effort.
         const mode = st.permissions.toMode();
-        sess.fsetstat(handle, .{ .flags = packets.ATTR_PERMISSIONS, .permissions = @intCast(mode & 0o7777) }) catch {};
+        const mtime_s: u32 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+        const atime_s: u32 = if (st.atime) |a|
+            @intCast(@divTrunc(a.nanoseconds, std.time.ns_per_s))
+        else
+            mtime_s;
+        sess.fsetstat(handle, .{
+            .flags = packets.ATTR_PERMISSIONS | packets.ATTR_ACMODTIME,
+            .permissions = @intCast(mode & 0o7777),
+            .atime = atime_s,
+            .mtime = mtime_s,
+        }) catch {};
     }
     try sess.close(handle);
     resume_mod.removeFile(io, sidecar);
@@ -248,6 +265,7 @@ pub fn downloadFile(
 ) !void {
     const rst = try sess.stat(remote_path);
     const total: u64 = rst.size;
+    vlog(opts, "download {s} -> {s} ({d} bytes)", .{ remote_path, local_path, total });
 
     const sidecar = try resume_mod.sidecarPath(gpa, local_path);
     defer gpa.free(sidecar);

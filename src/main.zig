@@ -19,9 +19,10 @@ const Args = struct {
     chunk_size: u32 = 8 * 1024 * 1024,
     bwlimit: u64 = 0,
     jobs: u32 = 1,
+    verbose: bool = false,
     files: []const []const u8 = &.{},
 
-    pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p', .jobs = 'j' };
+    pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p', .jobs = 'j', .verbose = 'v' };
     pub const help = .{
         .port = "ssh port (default 22)",
         .identity = "identity file",
@@ -31,6 +32,7 @@ const Args = struct {
         .chunk_size = "transfer chunk size in bytes (default 8 MiB)",
         .bwlimit = "limit transfer to N bytes/sec (default unlimited)",
         .jobs = "parallel transfer connections for -r (default 1)",
+        .verbose = "print one progress line per file to stderr",
         .files = "src dest (one remote [user@]host:path, one local)",
     };
 };
@@ -129,6 +131,7 @@ pub fn main(init: std.process.Init) !void {
         .resume_enabled = !v.no_resume,
         .preserve = v.preserve,
         .bwlimit_bps = v.bwlimit,
+        .verbose = v.verbose,
     };
 
     // Parallel directory transfer: collect the file list on one connection
