@@ -15,6 +15,7 @@ docker rm -f zioscp-sftp >/dev/null 2>&1 || true
 docker run -d --name zioscp-sftp -p 2222:2222 \
   -e PUID=1000 -e PGID=1000 -e USER_NAME=testuser \
   -e PUBLIC_KEY="$PUB" \
+  --tmpfs /diskfull:size=131072,uid=1000,gid=1000,mode=1777 \
   linuxserver/openssh-server:latest >/dev/null
 
 cleanup() { docker rm -f zioscp-sftp >/dev/null 2>&1 || true; }

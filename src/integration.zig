@@ -567,3 +567,75 @@ test "battle: corrupted local partial IS detected (MAC-verified resume)" {
     try testing.expectEqualSlices(u8, payload, got); // corruption fixed
     try testing.expect((cwd.statFile(io, mac_path, .{}) catch null) == null); // mac file removed on success
 }
+
+test "battle: disk-full fails cleanly mid-transfer (no hang, no silent success)" {
+    // /diskfull is a 128 KiB tmpfs the harness mounts in the container. A
+    // payload far larger than that forces the server into ENOSPC partway
+    // through: the transfer must FAIL (SSH_FX_FAILURE), not hang or report a
+    // bogus success, and it must have written a partial before stopping.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const local = "zioscp_diskfull_src.bin";
+    const remote = "/diskfull/zioscp_diskfull.bin";
+    const sidecar = "zioscp_diskfull_src.bin.zioscppart";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    const n: usize = 512 * 1024; // 4x the 128 KiB tmpfs -> guaranteed ENOSPC
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+    try cwd.writeFile(io, .{ .sub_path = local, .data = payload });
+
+    try testing.expectError(error.Failure, engine.uploadFile(
+        testing.allocator,
+        io,
+        &conn.sess,
+        local,
+        remote,
+        .{ .chunk_size = 32768 },
+    ));
+
+    // Mid-transfer failure: a partial landed, but the whole file did not. tmpfs
+    // counts metadata against the limit so the exact size varies; only assert
+    // it is strictly between 0 and the full size.
+    const rst = conn.sess.stat(remote) catch return error.UnexpectedTestFailure;
+    try testing.expect(rst.size > 0 and rst.size < n);
+}
+
+test "battle: permission-denied surfaces as a typed error" {
+    // `/` in the container is root-owned and not writable by testuser, so
+    // creating a file directly under it is denied. The engine must surface a
+    // typed PermissionDenied error, not hang or write a partial.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const local = "zioscp_perm_src.bin";
+    const sidecar = "zioscp_perm_src.bin.zioscppart";
+    const remote = "/zioscp_perm.bin";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    const payload = [_]u8{ 'P', 'E', 'R', 'M' };
+    try cwd.writeFile(io, .{ .sub_path = local, .data = &payload });
+
+    try testing.expectError(error.PermissionDenied, engine.uploadFile(
+        testing.allocator,
+        io,
+        &conn.sess,
+        local,
+        remote,
+        .{},
+    ));
+}
