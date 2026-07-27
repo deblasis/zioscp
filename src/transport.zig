@@ -135,6 +135,11 @@ pub const Connection = struct {
         self.proc.deinit();
         self.gpa.destroy(self.proc);
     }
+
+    /// ssh/stderr output captured by the drain (banners, diagnostics).
+    pub fn stderr(self: *Connection) []const u8 {
+        return self.proc.stderr_buf.items;
+    }
 };
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,9 @@
-//! Transfer engine: single-file upload/download with offset-based resume_mod.
+//! Transfer engine: single-file upload/download with offset-based resume.
 //!
 //! P1 is single-stream. Upload reads the local file at chunk offsets
 //! (positional reads) and writes them to the remote handle; download reads
 //! remote chunks and writes them to the local file positionally. A resume
-//! sidecar (resume_mod.zig) records next-offset after each chunk so an
+//! sidecar (resume.zig) records next-offset after each chunk so an
 //! interrupted transfer continues. Recursive directory transfer and
 //! permission preservation land in the follow-on pass.
 
@@ -21,6 +21,16 @@ pub const Options = struct {
     /// Apply source permissions/mtime to the destination. Not yet wired.
     preserve: bool = false,
 };
+
+/// SFTP v3 guarantees servers can process packets with at least ~34000 bytes
+/// of payload; OpenSSH caps near 256 KB. Keep each WRITE/READ payload well
+/// under that so a single packet never exceeds the server's max. The user's
+/// chunk_size still sets resume granularity, but each SFTP op is capped here.
+const max_sftp_payload: u32 = 32 * 1024;
+
+inline fn effectiveChunk(opts: Options) u32 {
+    return @min(opts.chunk_size, max_sftp_payload);
+}
 
 /// If a sidecar + valid partial exist, the offset to resume from; else 0.
 fn resumeOffsetUpload(
@@ -96,15 +106,15 @@ pub fn uploadFile(
     defer gpa.free(handle);
     errdefer sess.close(handle) catch {};
 
-    const buf = try gpa.alloc(u8, opts.chunk_size);
+    const buf = try gpa.alloc(u8, effectiveChunk(opts));
     defer gpa.free(buf);
     var off = next_off;
     while (off < total) {
-        const len: usize = @intCast(@min(@as(u64, opts.chunk_size), total - off));
+        const len: usize = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
         _ = try local.readPositionalAll(io, buf[0..len], off);
         try sess.write(handle, off, buf[0..len]);
         off += len;
-        record(io, gpa, sidecar, .upload, total, opts.chunk_size, off, local_path);
+        record(io, gpa, sidecar, .upload, total, effectiveChunk(opts), off, local_path);
     }
     try sess.close(handle);
     resume_mod.removeFile(io, sidecar);
@@ -137,11 +147,11 @@ pub fn downloadFile(
         try Dir.cwd().createFile(io, local_path, .{ .truncate = false });
     defer local.close(io);
 
-    const buf = try gpa.alloc(u8, opts.chunk_size);
+    const buf = try gpa.alloc(u8, effectiveChunk(opts));
     defer gpa.free(buf);
     var off = next_off;
     while (off < total) {
-        const want: u32 = @intCast(@min(@as(u64, opts.chunk_size), total - off));
+        const want: u32 = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
         const piece = sess.read(rh, off, want) catch |err| switch (err) {
             error.Eof => break,
             else => return err,
@@ -150,7 +160,7 @@ pub fn downloadFile(
         if (piece.len == 0) break;
         try local.writePositionalAll(io, piece, off);
         off += piece.len;
-        record(io, gpa, sidecar, .download, total, opts.chunk_size, off, remote_path);
+        record(io, gpa, sidecar, .download, total, effectiveChunk(opts), off, remote_path);
     }
     try sess.close(rh);
     resume_mod.removeFile(io, sidecar);
