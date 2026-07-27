@@ -127,7 +127,7 @@ pub const Connection = struct {
         errdefer proc.deinit();
         try proc.startDrain();
         var sess = client.Session(DuplexProcess).init(gpa, proc);
-        try sess.handshake();
+        _ = try sess.handshake();
         return .{ .gpa = gpa, .proc = proc, .sess = sess };
     }
 

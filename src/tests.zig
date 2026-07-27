@@ -8,4 +8,5 @@ test {
     _ = @import("chunker.zig");
     _ = @import("transport.zig");
     _ = @import("resume.zig");
+    _ = @import("engine.zig");
 }
