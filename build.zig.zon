@@ -8,6 +8,10 @@
             .url = "https://github.com/deblasis/ziocrypt/archive/refs/tags/v0.1.0.tar.gz",
             .hash = "ziocrypt-0.1.0-nzmSV-ogAAAIc9p7lNsv_X-moiPDaEOMlVVYO8r3R984",
         },
+        .ziojson = .{
+            .url = "https://github.com/deblasis/ziojson/archive/refs/tags/v0.4.0.tar.gz",
+            .hash = "ziojson-0.4.0-5G9pUqaWAAC6IaIjmCuJtbqn4Glrlxkg2jF1bTzzROif",
+        },
     },
     .paths = .{
         "build.zig",
