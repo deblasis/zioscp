@@ -267,3 +267,42 @@ test "integration: parallel (-j) upload then download round-trips a tree" {
     defer testing.allocator.free(gb);
     try testing.expectEqualSlices(u8, &b, gb);
 }
+
+test "integration: P3 single-file chunked parallel is byte-identical" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+    const local = "zioscp_p3_src.bin";
+    const remote = "/config/zioscp_p3.bin";
+    const pulled = "zioscp_p3_dst.bin";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, pulled) catch {};
+    defer conn_sess_remove(remote);
+
+    const n: usize = 200_000; // ~25 chunks at 8 KiB, so -j 4 actually fans out
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 11) % 251);
+    try cwd.writeFile(io, .{ .sub_path = local, .data = payload });
+
+    const argv = sshArgv();
+    try engine.uploadFileParallel(testing.allocator, &argv, local, remote, .{ .chunk_size = 8192 }, 4);
+    try engine.downloadFileParallel(testing.allocator, &argv, remote, pulled, .{ .chunk_size = 8192 }, 4);
+
+    const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(n, got.len);
+    try testing.expectEqualSlices(u8, payload, got);
+}
+
+fn conn_sess_remove(path: []const u8) void {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const argv = sshArgv();
+    var conn = transport.Connection.open(testing.allocator, io, &argv) catch return;
+    defer conn.deinit();
+    conn.sess.remove(path) catch {};
+}

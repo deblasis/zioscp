@@ -149,6 +149,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Single-file chunked parallel: shard one file across `jobs` connections.
+    if (!v.recursive and v.jobs > 1) {
+        if (download)
+            engine.downloadFileParallel(gpa, ssh_argv.items, spec.path, dest, opts, v.jobs) catch |err|
+                bail("download failed: {s}", .{@errorName(err)})
+        else
+            engine.uploadFileParallel(gpa, ssh_argv.items, src, spec.path, opts, v.jobs) catch |err|
+                bail("upload failed: {s}", .{@errorName(err)});
+        return;
+    }
+
     var conn = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
         bail("connection failed: {s}", .{@errorName(err)});
     defer conn.deinit();

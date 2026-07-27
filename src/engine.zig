@@ -14,6 +14,7 @@ const resume_mod = @import("resume.zig");
 const zioprogress = @import("zioprogress");
 const ziorate = @import("ziorate");
 const transport = @import("transport.zig");
+const chunker = @import("chunker.zig");
 
 const Dir = std.Io.Dir;
 const Session = client.Session;
@@ -481,6 +482,218 @@ pub fn runParallel(
     defer gpa.free(threads);
     for (0..j) |i| {
         threads[i] = std.Thread.spawn(.{}, parallelWorker, .{&ctx}) catch |err| {
+            for (threads[0..i]) |t| t.join();
+            return err;
+        };
+    }
+    for (threads) |t| t.join();
+}
+
+// ---------------------------------------------------------------------------
+// P3: single-file chunked parallel. One large file sharded across N ssh
+// sessions at disjoint offsets.
+//
+// The hard part is concurrent writes to ONE remote file. Protocol:
+//   1. One connection pre-truncates the remote fresh (WRITE|CREATE|TRUNC),
+//      then closes. This is the ONLY truncation.
+//   2. N workers each open the file WRITE|CREATE (NO TRUNC) and write the
+//      offset ranges they pull from a shared atomic chunk index.
+// Every chunk [0,total) is written by exactly one worker, so no holes remain;
+// sparse intermediate state is overwritten as ranges fill in. Download mirrors
+// this with concurrent remote reads + positional local writes.
+//
+// Resume is NOT coordinated in P3 v1 (a re-run re-truncates and restarts);
+// per-chunk resume is a follow-on. Small files (<=1 chunk) fall back to the
+// single-stream path.
+
+const ChunkCtx = struct {
+    gpa: std.mem.Allocator,
+    ssh_argv: []const []const u8,
+    opts: Options,
+    local_path: []const u8,
+    remote_path: []const u8,
+    total: u64,
+    chunk: u32,
+    count: u64,
+    next: std.atomic.Value(usize),
+    errors: std.atomic.Value(u32),
+};
+
+fn uploadChunkWorker(ctx: *ChunkCtx) void {
+    var threaded = std.Io.Threaded.init(ctx.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = transport.Connection.open(ctx.gpa, io, ctx.ssh_argv) catch return;
+    defer conn.deinit();
+    const handle = conn.sess.open(ctx.remote_path, packets.FXF_WRITE | packets.FXF_CREATE, packets.Attrs.empty) catch return;
+    defer {
+        conn.sess.close(handle) catch {};
+        ctx.gpa.free(handle);
+    }
+    var local = std.Io.Dir.cwd().openFile(io, ctx.local_path, .{}) catch return;
+    defer local.close(io);
+    const buf = ctx.gpa.alloc(u8, ctx.chunk) catch return;
+    defer ctx.gpa.free(buf);
+    while (true) {
+        const idx = ctx.next.fetchAdd(1, .monotonic);
+        if (idx >= ctx.count) break;
+        const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
+        if (r.len == 0) continue;
+        _ = local.readPositionalAll(io, buf[0..@intCast(r.len)], r.offset) catch {
+            _ = ctx.errors.fetchAdd(1, .monotonic);
+            continue;
+        };
+        conn.sess.write(handle, r.offset, buf[0..@intCast(r.len)]) catch {
+            _ = ctx.errors.fetchAdd(1, .monotonic);
+        };
+    }
+}
+
+fn downloadChunkWorker(ctx: *ChunkCtx) void {
+    var threaded = std.Io.Threaded.init(ctx.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = transport.Connection.open(ctx.gpa, io, ctx.ssh_argv) catch return;
+    defer conn.deinit();
+    const rh = conn.sess.open(ctx.remote_path, packets.FXF_READ, packets.Attrs.empty) catch return;
+    defer {
+        conn.sess.close(rh) catch {};
+        ctx.gpa.free(rh);
+    }
+    var local = std.Io.Dir.cwd().createFile(io, ctx.local_path, .{ .truncate = false }) catch return;
+    defer local.close(io);
+    while (true) {
+        const idx = ctx.next.fetchAdd(1, .monotonic);
+        if (idx >= ctx.count) break;
+        const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
+        if (r.len == 0) continue;
+        const want: u32 = @intCast(r.len);
+        const piece = conn.sess.read(rh, r.offset, want) catch |err| switch (err) {
+            error.Eof => break,
+            else => {
+                _ = ctx.errors.fetchAdd(1, .monotonic);
+                continue;
+            },
+        };
+        defer ctx.gpa.free(piece);
+        if (piece.len == 0) break;
+        local.writePositionalAll(io, piece, r.offset) catch {
+            _ = ctx.errors.fetchAdd(1, .monotonic);
+        };
+    }
+}
+
+/// Upload a single file in parallel across `jobs` ssh connections, sharding it
+/// at offset ranges. Falls back to single-stream for files that fit in one
+/// chunk. See the P3 note above on the concurrent-write protocol.
+pub fn uploadFileParallel(
+    gpa: std.mem.Allocator,
+    ssh_argv: []const []const u8,
+    local_path: []const u8,
+    remote_path: []const u8,
+    opts: Options,
+    jobs: u32,
+) !void {
+    // Use a short-lived io just to stat (the workers make their own).
+    var t0 = std.Io.Threaded.init(gpa, .{});
+    defer t0.deinit();
+    const io0 = t0.io();
+    const total: u64 = (try std.Io.Dir.cwd().statFile(io0, local_path, .{})).size;
+    const chunk = effectiveChunk(opts);
+    const count = chunker.chunkCount(total, chunk);
+    if (count <= 1) {
+        var conn = try transport.Connection.open(gpa, io0, ssh_argv);
+        defer conn.deinit();
+        try uploadFile(gpa, io0, &conn.sess, local_path, remote_path, opts);
+        return;
+    }
+
+    // Pre-truncate the remote fresh (the only truncation).
+    {
+        var c = try transport.Connection.open(gpa, io0, ssh_argv);
+        defer c.deinit();
+        const h = try c.sess.open(remote_path, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+        defer {
+            c.sess.close(h) catch {};
+            gpa.free(h);
+        }
+    }
+
+    var ctx: ChunkCtx = .{
+        .gpa = gpa,
+        .ssh_argv = ssh_argv,
+        .opts = opts,
+        .local_path = local_path,
+        .remote_path = remote_path,
+        .total = total,
+        .chunk = chunk,
+        .count = count,
+        .next = std.atomic.Value(usize).init(0),
+        .errors = std.atomic.Value(u32).init(0),
+    };
+    try spawnChunkWorkers(gpa, uploadChunkWorker, &ctx, jobs, count);
+    if (ctx.errors.load(.monotonic) != 0) return error.Failure;
+}
+
+/// Download a single file in parallel across `jobs` ssh connections.
+pub fn downloadFileParallel(
+    gpa: std.mem.Allocator,
+    ssh_argv: []const []const u8,
+    remote_path: []const u8,
+    local_path: []const u8,
+    opts: Options,
+    jobs: u32,
+) !void {
+    var t0 = std.Io.Threaded.init(gpa, .{});
+    defer t0.deinit();
+    const io0 = t0.io();
+    var probe = try transport.Connection.open(gpa, io0, ssh_argv);
+    const total: u64 = (try probe.sess.stat(remote_path)).size;
+    probe.deinit();
+
+    const chunk = effectiveChunk(opts);
+    const count = chunker.chunkCount(total, chunk);
+    if (count <= 1) {
+        var conn = try transport.Connection.open(gpa, io0, ssh_argv);
+        defer conn.deinit();
+        try downloadFile(gpa, io0, &conn.sess, remote_path, local_path, opts);
+        return;
+    }
+
+    // Pre-create+truncate the local file fresh.
+    {
+        var f = try std.Io.Dir.cwd().createFile(io0, local_path, .{ .truncate = true });
+        f.close(io0);
+    }
+
+    var ctx: ChunkCtx = .{
+        .gpa = gpa,
+        .ssh_argv = ssh_argv,
+        .opts = opts,
+        .local_path = local_path,
+        .remote_path = remote_path,
+        .total = total,
+        .chunk = chunk,
+        .count = count,
+        .next = std.atomic.Value(usize).init(0),
+        .errors = std.atomic.Value(u32).init(0),
+    };
+    try spawnChunkWorkers(gpa, downloadChunkWorker, &ctx, jobs, count);
+    if (ctx.errors.load(.monotonic) != 0) return error.Failure;
+}
+
+fn spawnChunkWorkers(
+    gpa: std.mem.Allocator,
+    comptime worker: anytype,
+    ctx: *ChunkCtx,
+    jobs: u32,
+    count: u64,
+) !void {
+    const j: usize = @min(@as(usize, @intCast(jobs)), @as(usize, @intCast(count)));
+    const threads = try gpa.alloc(std.Thread, j);
+    defer gpa.free(threads);
+    for (0..j) |i| {
+        threads[i] = std.Thread.spawn(.{}, worker, .{ctx}) catch |err| {
             for (threads[0..i]) |t| t.join();
             return err;
         };
