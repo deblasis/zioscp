@@ -227,7 +227,16 @@ pub fn uploadFile(
             off += len;
             in_flight += 1;
         }
-        try sess.awaitAnyOk();
+        sess.awaitAnyOk() catch |err| {
+            // awaitAnyOk consumed one reply (a bad status, e.g. ENOSPC) or the
+            // link died. Best-effort drain the remaining outstanding replies so
+            // a recoverable status failure does not desynchronize the session
+            // for a caller that reuses it: the server still replies to each
+            // in-flight WRITE (FIFO), so draining keeps the stream aligned.
+            if (in_flight > 0) in_flight -= 1;
+            while (in_flight > 0) : (in_flight -= 1) sess.awaitAnyOk() catch {};
+            return err;
+        };
         in_flight -= 1;
         acked_writes += 1;
         const acked_off: u64 = @min(acked_writes * @as(u64, chunk), total);
@@ -569,6 +578,10 @@ pub fn runParallel(
         };
     }
     for (threads) |t| t.join();
+    // Per-file failures are logged + counted in the workers (the remaining
+    // files still transfer, matching scp's "skip and continue"). But a run with
+    // any failure must surface a non-zero exit, not silently succeed.
+    if (ctx.errors.load(.monotonic) != 0) return error.Failure;
 }
 
 // ---------------------------------------------------------------------------
