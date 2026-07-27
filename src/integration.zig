@@ -306,3 +306,197 @@ fn conn_sess_remove(path: []const u8) void {
     defer conn.deinit();
     conn.sess.remove(path) catch {};
 }
+
+// ---- Battle tests: resume robustness under failure -----------------------
+
+test "battle: resume a download after a partial transfer" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const remote = "/config/zioscp_battle_dl.bin";
+    const local = "zioscp_battle_dl.bin";
+    const sidecar = "zioscp_battle_dl.bin.zioscppart";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    // Full file on the remote.
+    const n: usize = 50_000;
+    const cut: usize = 20_000;
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 17) % 251);
+    const wh = try conn.sess.open(remote, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+    defer testing.allocator.free(wh);
+    var off: u64 = 0;
+    while (off < n) : (off += 8192) {
+        const end = @min(off + 8192, n);
+        try conn.sess.write(wh, off, payload[off..end]);
+    }
+    try conn.sess.close(wh);
+
+    // Simulate a download killed `cut` bytes in: a local partial + sidecar.
+    try cwd.writeFile(io, .{ .sub_path = local, .data = payload[0..cut] });
+    try resume_mod.writeFile(io, testing.allocator, sidecar, .{
+        .direction = .download,
+        .total_size = n,
+        .chunk_size = 8192,
+        .next_offset = cut,
+        .source_name = remote,
+        .source_size = n,
+        .source_mtime = 0,
+    });
+
+    // Resume: downloadFile continues from `cut`, not from 0.
+    try engine.downloadFile(testing.allocator, io, &conn.sess, remote, local, .{ .chunk_size = 8192, .resume_enabled = true });
+    const got = cwd.readFileAlloc(io, local, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(n, got.len);
+    try testing.expectEqualSlices(u8, payload, got);
+    try testing.expect((cwd.statFile(io, sidecar, .{}) catch null) == null); // sidecar removed
+}
+
+test "battle: truncated partial (smaller than sidecar) forces a restart" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const remote = "/config/zioscp_battle_trunc.bin";
+    const local = "zioscp_battle_trunc.bin";
+    const sidecar = "zioscp_battle_trunc.bin.zioscppart";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    const n: usize = 40_000;
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 5) % 251);
+    const wh = try conn.sess.open(remote, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+    defer testing.allocator.free(wh);
+    try conn.sess.write(wh, 0, payload);
+    try conn.sess.close(wh);
+
+    // Sidecar claims 30_000 done, but the local partial is only 10_000 bytes
+    // (e.g. a crash truncated it). Resume must detect size < next_offset and
+    // restart cleanly from 0, not trust the stale sidecar.
+    try cwd.writeFile(io, .{ .sub_path = local, .data = payload[0..10_000] });
+    try resume_mod.writeFile(io, testing.allocator, sidecar, .{
+        .direction = .download,
+        .total_size = n,
+        .chunk_size = 8192,
+        .next_offset = 30_000,
+        .source_name = remote,
+        .source_size = n,
+        .source_mtime = 0,
+    });
+
+    try engine.downloadFile(testing.allocator, io, &conn.sess, remote, local, .{ .chunk_size = 8192, .resume_enabled = true });
+    const got = cwd.readFileAlloc(io, local, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(n, got.len);
+    try testing.expectEqualSlices(u8, payload, got);
+}
+
+test "battle: source changed (size mismatch) forces a restart" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const remote = "/config/zioscp_battle_chg.bin";
+    const local = "zioscp_battle_chg.bin";
+    const sidecar = "zioscp_battle_chg.bin.zioscppart";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    // Remote file is now 30_000 bytes (changed since a prior 50_000-byte run).
+    const n: usize = 30_000;
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 23) % 251);
+    const wh = try conn.sess.open(remote, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+    defer testing.allocator.free(wh);
+    try conn.sess.write(wh, 0, payload);
+    try conn.sess.close(wh);
+
+    // Stale sidecar from the old 50_000-byte source.
+    try resume_mod.writeFile(io, testing.allocator, sidecar, .{
+        .direction = .download,
+        .total_size = 50_000,
+        .chunk_size = 8192,
+        .next_offset = 25_000,
+        .source_name = remote,
+        .source_size = 50_000,
+        .source_mtime = 0,
+    });
+
+    try engine.downloadFile(testing.allocator, io, &conn.sess, remote, local, .{ .chunk_size = 8192, .resume_enabled = true });
+    const got = cwd.readFileAlloc(io, local, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(n, got.len);
+    try testing.expectEqualSlices(u8, payload, got);
+}
+
+test "battle: corrupted local partial is NOT detected (KNOWN GAP)" {
+    // Characterization test: offset-based resume trusts a partial whose SIZE
+    // matches the sidecar, so a byte flipped on disk between runs survives.
+    // This proves the gap; MAC-verified download resume (chunker.hashChunk is
+    // wired) is the fix. Flip this test's expectation when that lands.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const remote = "/config/zioscp_battle_corr.bin";
+    const local = "zioscp_battle_corr.bin";
+    const sidecar = "zioscp_battle_corr.bin.zioscppart";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    const n: usize = 32_769; // just over one 32 KiB chunk
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 29) % 251);
+    const wh = try conn.sess.open(remote, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+    defer testing.allocator.free(wh);
+    try conn.sess.write(wh, 0, payload);
+    try conn.sess.close(wh);
+
+    // "Completed" local partial that has been corrupted at one byte.
+    var corrupted = testing.allocator.dupe(u8, payload) catch return error.OutOfMemory;
+    defer testing.allocator.free(corrupted);
+    corrupted[100] ^= 0xff;
+    try cwd.writeFile(io, .{ .sub_path = local, .data = corrupted });
+    try resume_mod.writeFile(io, testing.allocator, sidecar, .{
+        .direction = .download,
+        .total_size = n,
+        .chunk_size = 32768,
+        .next_offset = n, // claims fully done
+        .source_name = remote,
+        .source_size = n,
+        .source_mtime = 0,
+    });
+
+    // Resume sees size >= next_offset, re-downloads nothing, "succeeds" -- but
+    // the corruption is still there.
+    try engine.downloadFile(testing.allocator, io, &conn.sess, remote, local, .{ .chunk_size = 32768, .resume_enabled = true });
+    const got = cwd.readFileAlloc(io, local, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqual(n, got.len);
+    // PROVES THE GAP: the flipped byte survived "resume".
+    try testing.expect(got[100] != payload[100]);
+}
