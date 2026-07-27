@@ -1,0 +1,14 @@
+.{
+    .name = .zioscp,
+    .version = "0.1.0",
+    .fingerprint = 0xa47ee23cb1e90f50,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
