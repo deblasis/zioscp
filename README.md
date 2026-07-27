@@ -48,8 +48,15 @@ bogus fast time. Run it after the integration container is up.
 On loopback, single-large-file throughput is filesystem/protocol-overhead bound,
 so the meaningful comparison is many-small-files (per-file overhead), where
 zioscp's lean collect-then-transfer beats scp's chattier recursive protocol.
-The `-j` wide-area-network speedup needs a latency-injected link (tc netem
-behind a Linux router), which the localhost harness cannot simulate.
+
+The wide-area-network speedup is measured by `tests/bench-latency.sh`, which
+runs on a Linux host with `tc netem` (it injects RTT on the loopback; the
+control session rides a different interface). Representative result at 100 ms
+RTT, 50 files: `scp -r` 28 s vs `zioscp -r -j4` 7.7 s (**3.7x faster**).
+Single-file upload also beats scp under latency (the upload pipeline keeps many
+SFTP WRITEs in flight). Download does not yet -- it is not pipelined -- so a
+single-file download under latency is slower than scp (use `-j` for parallel
+download, or wait for download pipelining).
 
 ## Design
 
