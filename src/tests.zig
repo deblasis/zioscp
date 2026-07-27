@@ -7,4 +7,5 @@ test {
     _ = @import("sftp/client.zig");
     _ = @import("chunker.zig");
     _ = @import("transport.zig");
+    _ = @import("resume.zig");
 }
