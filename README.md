@@ -32,11 +32,22 @@ zig build test     # unit tests
 just ci            # fmt-check + build + test (what CI runs)
 ```
 
-The SFTP integration tests need a Docker `openssh-server` harness:
+### Transport backend
+
+The default (`-Dbackend=ssh`, the default) drives a system `ssh` subprocess, so
+it works anywhere `ssh` is installed. An experimental self-contained backend
+that links libssh2 directly (no `ssh` dependency) is available:
 
 ```
-tests/sftp-integration.sh   # starts the container, runs zig build integration
+zig build -Dbackend=libssh2     # links -lssh2 (needs libssh2 on the system)
 ```
+
+libssh2 provides only the SSH transport: zioscp opens a channel to the `sftp`
+subsystem and runs its existing SFTP codec over the channel bytes, so all the
+SFTP/resume/pipeline logic is shared. Single-file and recursive (`-r`)
+transfers work; parallel (`-j`) is not yet wired through this backend. Host-key
+verification and vendoring libssh2 (for a true single static binary, no system
+lib) are follow-ons.
 
 ## Benchmark
 

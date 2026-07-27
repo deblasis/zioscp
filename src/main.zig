@@ -9,6 +9,7 @@ const transport = @import("transport.zig");
 const engine = @import("engine.zig");
 const packets = @import("sftp/packets.zig");
 const zioarg = @import("zioarg");
+const config = @import("config");
 
 const Args = struct {
     port: []const u8 = "22",
@@ -69,6 +70,62 @@ fn remoteIsDir(sess: anytype, path: []const u8) bool {
     const a = sess.stat(path) catch return false;
     return (a.flags & packets.ATTR_PERMISSIONS != 0) and
         ((a.permissions & 0o170000) == 0o040000);
+}
+
+/// Single-connection transfer (sequential: file or -r tree). Generic over the
+/// session so it works with both the ssh-subprocess and libssh2 backends.
+fn transfer(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    sess: anytype,
+    opts: engine.Options,
+    download: bool,
+    recursive: bool,
+    src: []const u8,
+    dest: []const u8,
+    remote_path: []const u8,
+) !void {
+    if (download) {
+        if (recursive and remoteIsDir(sess, remote_path))
+            try engine.downloadDir(gpa, io, sess, remote_path, dest, opts)
+        else
+            try engine.downloadFile(gpa, io, sess, remote_path, dest, opts);
+    } else {
+        if (recursive and isLocalDir(io, src))
+            try engine.uploadDir(gpa, io, sess, src, remote_path, opts)
+        else
+            try engine.uploadFile(gpa, io, sess, src, remote_path, opts);
+    }
+}
+
+/// libssh2-backend single-connection transfer. Only analyzed (and libssh2 only
+/// linked) when -Dbackend=libssh2, because this is reached solely through the
+/// comptime branch in main.
+fn transferLibssh2(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    opts: engine.Options,
+    download: bool,
+    recursive: bool,
+    src: []const u8,
+    dest: []const u8,
+    remote_path: []const u8,
+    user_host: []const u8,
+    port_s: []const u8,
+    identity: ?[]const u8,
+) !void {
+    const tl = @import("transport_libssh2.zig");
+    const at = std.mem.indexOfScalar(u8, user_host, '@') orelse
+        bail("libssh2 backend requires user@host", .{});
+    const user = user_host[0..at];
+    const host = user_host[at + 1 ..];
+    const port = std.fmt.parseInt(u16, port_s, 10) catch 22;
+    const key = identity orelse bail("libssh2 backend requires -i <key>", .{});
+    var conn = tl.Connection.open(gpa, io, host, port, user, key) catch |err|
+        bail("libssh2 connection failed: {s}", .{@errorName(err)});
+    defer conn.deinit();
+    transfer(gpa, io, &conn.sess, opts, download, recursive, src, dest, remote_path) catch |err|
+        bail("transfer failed: {s}", .{@errorName(err)});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -134,6 +191,11 @@ pub fn main(init: std.process.Init) !void {
         .verbose = v.verbose,
     };
 
+    // The parallel paths (runParallel / *FileParallel) spawn their own ssh
+    // subprocesses; the libssh2 backend is single-connection for now.
+    if (v.jobs > 1 and config.backend == .libssh2)
+        bail("parallel transfers (-j) are not yet supported with the libssh2 backend", .{});
+
     // Parallel directory transfer: collect the file list on one connection
     // (also pre-creating dirs), then fan out across `jobs` connections.
     if (v.recursive and v.jobs > 1) {
@@ -163,25 +225,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (config.backend == .libssh2) {
+        transferLibssh2(gpa, io, opts, download, v.recursive, src, dest, spec.path, spec.user_host, v.port, v.identity) catch |err|
+            bail("transfer failed: {s}", .{@errorName(err)});
+        return;
+    }
+
     var conn = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
         bail("connection failed: {s}", .{@errorName(err)});
     defer conn.deinit();
-
-    if (download) {
-        if (v.recursive and remoteIsDir(&conn.sess, spec.path)) {
-            engine.downloadDir(gpa, io, &conn.sess, spec.path, dest, opts) catch |err|
-                bail("download failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
-        } else {
-            engine.downloadFile(gpa, io, &conn.sess, spec.path, dest, opts) catch |err|
-                bail("download failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
-        }
-    } else {
-        if (v.recursive and isLocalDir(io, src)) {
-            engine.uploadDir(gpa, io, &conn.sess, src, spec.path, opts) catch |err|
-                bail("upload failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
-        } else {
-            engine.uploadFile(gpa, io, &conn.sess, src, spec.path, opts) catch |err|
-                bail("upload failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
-        }
-    }
+    transfer(gpa, io, &conn.sess, opts, download, v.recursive, src, dest, spec.path) catch |err|
+        bail("transfer failed: {s}\nssh stderr: {s}", .{ @errorName(err), conn.stderr() });
 }

@@ -4,6 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // SSH transport backend: "ssh" (default) drives a system ssh subprocess;
+    // "libssh2" links libssh2 for a self-contained binary (no ssh dependency).
+    const backend = b.option(enum { ssh, libssh2 }, "backend", "SSH transport backend") orelse .ssh;
+
     // Fleet dependencies (published tarballs).
     const ziocrypt_mod = b.dependency("ziocrypt", .{
         .target = target,
@@ -36,10 +40,23 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("zioprogress", zioprogress_mod);
     exe_mod.addImport("ziorate", ziorate_mod);
     exe_mod.addImport("zioarg", zioarg_mod);
+
+    // Expose the backend choice to the source as a comptime value.
+    const build_opts = b.addOptions();
+    build_opts.addOption(@TypeOf(backend), "backend", backend);
+    exe_mod.addOptions("config", build_opts);
+
     const exe = b.addExecutable(.{
         .name = "zioscp",
         .root_module = exe_mod,
     });
+    if (backend == .libssh2) {
+        // Homebrew (Apple Silicon) puts libssh2.dylib here; pkg-config lookup is
+        // unreliable from the zig build, so point at it directly. Vendoring the
+        // source (slice 2) removes this system dependency.
+        exe_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        exe_mod.linkSystemLibrary("ssh2", .{}); // -lssh2; implies libc
+    }
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
