@@ -660,21 +660,44 @@ fn uploadChunkWorker(ctx: *ChunkCtx) void {
     defer local.close(io);
     const buf = ctx.gpa.alloc(u8, ctx.chunk) catch return;
     defer ctx.gpa.free(buf);
+    // Pipeline within the worker: keep up to `window` WRITEs in flight over
+    // this connection, mirroring the single-stream upload pipeline so a chunked
+    // -j transfer also hides RTT. `inflight` is the FIFO of chunk indices whose
+    // STATUS replies are outstanding (each marked done in the bitmap on ack).
+    const window: usize = 64;
+    var inflight: std.ArrayList(usize) = .empty;
+    defer inflight.deinit(ctx.gpa);
     while (true) {
-        const idx = ctx.next.fetchAdd(1, .monotonic);
-        if (idx >= ctx.count) break;
-        if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
-        const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
-        if (r.len == 0) continue;
-        _ = local.readPositionalAll(io, buf[0..@intCast(r.len)], r.offset) catch {
-            _ = ctx.errors.fetchAdd(1, .monotonic);
-            continue;
+        while (inflight.items.len < window) {
+            const idx = ctx.next.fetchAdd(1, .monotonic);
+            if (idx >= ctx.count) break;
+            if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
+            const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
+            if (r.len == 0) continue;
+            _ = local.readPositionalAll(io, buf[0..@intCast(r.len)], r.offset) catch {
+                _ = ctx.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+            conn.sess.sendWriteUnacked(handle, r.offset, buf[0..@intCast(r.len)]) catch {
+                _ = ctx.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+            inflight.append(ctx.gpa, idx) catch {
+                _ = ctx.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+        }
+        if (inflight.items.len == 0) break;
+        conn.sess.awaitAnyOk() catch {
+            // Link in trouble: drain the remaining outstanding replies and stop.
+            var n = inflight.items.len;
+            if (n > 0) n -= 1; // awaitAnyOk already consumed one
+            while (n > 0) : (n -= 1) conn.sess.awaitAnyOk() catch {};
+            _ = ctx.errors.fetchAdd(@intCast(inflight.items.len), .monotonic);
+            return;
         };
-        conn.sess.write(handle, r.offset, buf[0..@intCast(r.len)]) catch {
-            _ = ctx.errors.fetchAdd(1, .monotonic);
-            continue;
-        };
-        resume_mod.markChunkDone(io, ctx.bitmap_path, idx) catch {};
+        const done_idx = inflight.orderedRemove(0);
+        resume_mod.markChunkDone(io, ctx.bitmap_path, done_idx) catch {};
     }
 }
 
@@ -691,26 +714,48 @@ fn downloadChunkWorker(ctx: *ChunkCtx) void {
     }
     var local = std.Io.Dir.cwd().createFile(io, ctx.local_path, .{ .truncate = false }) catch return;
     defer local.close(io);
+    // Pipeline within the worker: keep up to `window` READs in flight, mirroring
+    // the single-stream download pipeline. `inflight` is the FIFO of chunk
+    // indices whose DATA replies are outstanding; each reply lands at its
+    // chunkRange offset and is marked done in the bitmap.
+    const window: usize = 64;
+    var inflight: std.ArrayList(usize) = .empty;
+    defer inflight.deinit(ctx.gpa);
     while (true) {
-        const idx = ctx.next.fetchAdd(1, .monotonic);
-        if (idx >= ctx.count) break;
-        if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
-        const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
-        if (r.len == 0) continue;
-        const want: u32 = @intCast(r.len);
-        const piece = conn.sess.read(rh, r.offset, want) catch |err| switch (err) {
-            error.Eof => break,
-            else => {
+        while (inflight.items.len < window) {
+            const idx = ctx.next.fetchAdd(1, .monotonic);
+            if (idx >= ctx.count) break;
+            if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
+            const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
+            if (r.len == 0) continue;
+            conn.sess.sendReadUnacked(rh, r.offset, @intCast(r.len)) catch {
                 _ = ctx.errors.fetchAdd(1, .monotonic);
                 continue;
-            },
+            };
+            inflight.append(ctx.gpa, idx) catch {
+                _ = ctx.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+        }
+        if (inflight.items.len == 0) break;
+        const piece = conn.sess.recvData() catch {
+            var n = inflight.items.len;
+            while (n > 0) : (n -= 1) _ = conn.sess.recvData() catch {};
+            _ = ctx.errors.fetchAdd(@intCast(inflight.items.len + 1), .monotonic);
+            return;
         };
-        defer ctx.gpa.free(piece);
-        if (piece.len == 0) break;
+        const idx = inflight.orderedRemove(0);
+        const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
+        if (piece.len == 0) {
+            ctx.gpa.free(piece);
+            continue;
+        }
         local.writePositionalAll(io, piece, r.offset) catch {
+            ctx.gpa.free(piece);
             _ = ctx.errors.fetchAdd(1, .monotonic);
             continue;
         };
+        ctx.gpa.free(piece);
         resume_mod.markChunkDone(io, ctx.bitmap_path, idx) catch {};
     }
 }
