@@ -3,7 +3,12 @@
     .version = "0.1.0",
     .fingerprint = 0xa47ee23cb1e90f50,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .ziocrypt = .{
+            .url = "https://github.com/deblasis/ziocrypt/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "ziocrypt-0.1.0-nzmSV-ogAAAIc9p7lNsv_X-moiPDaEOMlVVYO8r3R984",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

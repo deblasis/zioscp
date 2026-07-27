@@ -5,4 +5,5 @@ const std = @import("std");
 test {
     _ = @import("sftp/packets.zig");
     _ = @import("sftp/client.zig");
+    _ = @import("chunker.zig");
 }
