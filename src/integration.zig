@@ -10,6 +10,7 @@ const packets = @import("sftp/packets.zig");
 const transport = @import("transport.zig");
 const engine = @import("engine.zig");
 const resume_mod = @import("resume.zig");
+const chunker = @import("chunker.zig");
 
 const testing = std.testing;
 
@@ -499,4 +500,70 @@ test "battle: corrupted local partial is NOT detected (KNOWN GAP)" {
     try testing.expectEqual(n, got.len);
     // PROVES THE GAP: the flipped byte survived "resume".
     try testing.expect(got[100] != payload[100]);
+}
+
+test "battle: corrupted local partial IS detected (MAC-verified resume)" {
+    // The flip-side of the offset-resume gap: with a MAC file present (as a
+    // real interrupted download records), a byte flipped on disk between runs
+    // is detected on resume and the corrupted chunk is re-fetched, so the
+    // final file is correct.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var conn = connect(io, testing.allocator) orelse return error.SkipZigTest;
+    defer conn.deinit();
+
+    const cwd = std.Io.Dir.cwd();
+    const remote = "/config/zioscp_battle_mac.bin";
+    const local = "zioscp_battle_mac.bin";
+    const sidecar = "zioscp_battle_mac.bin.zioscppart";
+    const mac_path = "zioscp_battle_mac.bin.zioscpmac";
+    defer cwd.deleteFile(io, local) catch {};
+    defer cwd.deleteFile(io, sidecar) catch {};
+    defer cwd.deleteFile(io, mac_path) catch {};
+    defer conn.sess.remove(remote) catch {};
+
+    const n: usize = 32_769; // 2 chunks at 32 KiB
+    const chunk: usize = 32_768;
+    const payload = testing.allocator.alloc(u8, n) catch return error.OutOfMemory;
+    defer testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = @intCast((i * 29) % 251);
+    const wh = try conn.sess.open(remote, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
+    defer testing.allocator.free(wh);
+    try conn.sess.write(wh, 0, payload);
+    try conn.sess.close(wh);
+
+    // Local partial: payload with byte 100 corrupted.
+    var corrupted = testing.allocator.dupe(u8, payload) catch return error.OutOfMemory;
+    defer testing.allocator.free(corrupted);
+    corrupted[100] ^= 0xff;
+    try cwd.writeFile(io, .{ .sub_path = local, .data = corrupted });
+
+    // Sidecar claims the download is complete.
+    try resume_mod.writeFile(io, testing.allocator, sidecar, .{
+        .direction = .download,
+        .total_size = n,
+        .chunk_size = @intCast(chunk),
+        .next_offset = n,
+        .source_name = remote,
+        .source_size = n,
+        .source_mtime = 0,
+    });
+    // MAC file: the CORRECT MACs of the payload's chunks (what a clean run
+    // would have recorded). Verify re-MACs the corrupted local -> mismatch.
+    var ci: usize = 0;
+    while (ci * chunk < n) : (ci += 1) {
+        const s = ci * chunk;
+        const e = @min(s + chunk, n);
+        const mac = chunker.hashChunk(testing.allocator, payload[s..e]) catch return error.OutOfMemory;
+        defer testing.allocator.free(mac);
+        try resume_mod.appendMac(io, mac_path, mac, ci);
+    }
+
+    // Resume: detects the corruption, re-fetches, lands correct.
+    try engine.downloadFile(testing.allocator, io, &conn.sess, remote, local, .{ .chunk_size = @intCast(chunk), .resume_enabled = true });
+    const got = cwd.readFileAlloc(io, local, testing.allocator, .limited(1 << 24)) catch return error.UnexpectedTestFailure;
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, payload, got); // corruption fixed
+    try testing.expect((cwd.statFile(io, mac_path, .{}) catch null) == null); // mac file removed on success
 }

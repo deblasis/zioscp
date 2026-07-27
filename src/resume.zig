@@ -125,6 +125,46 @@ pub fn removeFile(io: std.Io, path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
+// --- MAC file (download-resume integrity) --------------------------------
+// One SHA-256 hex (64 bytes) + '\n' per downloaded chunk, written via
+// positional I/O so appending never rewrites earlier entries (no O(n^2)).
+// On resume the engine re-MACs each completed local chunk and resumes from
+// the first mismatch; re-downloaded chunks overwrite their stale MACs in
+// place, so the file never needs truncation.
+
+pub fn macPath(gpa: std.mem.Allocator, dest_path: []const u8) error{OutOfMemory}![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}.zioscpmac", .{dest_path}) catch error.OutOfMemory;
+}
+
+const mac_line_len = 65; // 64 hex chars + '\n'
+
+/// Append chunk `index`'s MAC. `mac_hex` must be 64 bytes. Writes at the
+/// chunk's fixed line offset, overwriting any stale entry there.
+pub fn appendMac(io: std.Io, path: []const u8, mac_hex: []const u8, index: u64) !void {
+    if (mac_hex.len != 64) return error.BadString;
+    var f = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false });
+    defer f.close(io);
+    var line: [mac_line_len]u8 = undefined;
+    @memcpy(line[0..64], mac_hex);
+    line[64] = '\n';
+    try f.writePositionalAll(io, &line, index * mac_line_len);
+}
+
+/// Read the raw MAC file bytes, or null if absent. Caller frees.
+pub fn readMacFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    return bytes;
+}
+
+/// Number of MAC lines (== completed chunks) recorded, 0 if absent.
+pub fn macCount(io: std.Io, path: []const u8) !u64 {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
+    return st.size / mac_line_len;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

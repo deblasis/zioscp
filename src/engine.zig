@@ -272,6 +272,15 @@ pub fn downloadFile(
 
     var next_off: u64 = 0;
     if (opts.resume_enabled) next_off = try resumeOffsetDownload(io, gpa, local_path, sidecar, total);
+    const mac_path = try resume_mod.macPath(gpa, local_path);
+    defer gpa.free(mac_path);
+    // MAC-verify completed chunks; a mismatch (corruption / stale partial)
+    // wins over the sidecar offset and forces a re-fetch from there.
+    if (opts.resume_enabled) {
+        if (verifyDownloadMacs(io, gpa, local_path, mac_path, effectiveChunk(opts), total) catch null) |verified| {
+            if (verified < next_off) next_off = verified;
+        }
+    }
 
     const rh = try sess.open(remote_path, packets.FXF_READ, packets.Attrs.empty);
     defer gpa.free(rh);
@@ -298,6 +307,11 @@ pub fn downloadFile(
         defer gpa.free(piece); // frees this iteration's slice
         if (piece.len == 0) break;
         try local.writePositionalAll(io, piece, off);
+        // Record this chunk's MAC for integrity-checked resume.
+        if (chunker.hashChunk(gpa, piece)) |mac| {
+            resume_mod.appendMac(io, mac_path, mac, off / @as(u64, effectiveChunk(opts))) catch {};
+            gpa.free(mac);
+        } else |_| {}
         off += piece.len;
         record(io, gpa, sidecar, .download, total, effectiveChunk(opts), off, remote_path);
         prog.step(@intCast(piece.len));
@@ -305,6 +319,40 @@ pub fn downloadFile(
     prog.finish();
     try sess.close(rh);
     resume_mod.removeFile(io, sidecar);
+    resume_mod.removeFile(io, mac_path);
+}
+
+/// Re-MAC each completed local chunk and compare to the stored MAC file.
+/// Returns null if there is no MAC file (keep the offset-based resume); else
+/// the byte offset to resume from: the first mismatch's chunk start, or
+/// (mac count * chunk) if all verified.
+fn verifyDownloadMacs(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    local_path: []const u8,
+    mac_path: []const u8,
+    chunk: u32,
+    total: u64,
+) !?u64 {
+    const bytes = (try resume_mod.readMacFile(io, gpa, mac_path)) orelse return null;
+    defer gpa.free(bytes);
+    const count = bytes.len / 65;
+    if (count == 0) return null;
+    var f = std.Io.Dir.cwd().openFile(io, local_path, .{}) catch return 0;
+    defer f.close(io);
+    const buf = try gpa.alloc(u8, @intCast(chunk));
+    defer gpa.free(buf);
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const off = i * chunk;
+        if (off >= total) return total;
+        const len = @min(@as(u64, chunk), total - off);
+        _ = f.readPositionalAll(io, buf[0..@intCast(len)], off) catch return off;
+        const h = chunker.hashChunk(gpa, buf[0..@intCast(len)]) catch return off;
+        defer gpa.free(h);
+        if (!std.mem.eql(u8, h, bytes[i * 65 ..][0..64])) return off; // mismatch
+    }
+    return count * @as(u64, chunk);
 }
 
 fn remoteMkdir(sess: anytype, path: []const u8) void {
