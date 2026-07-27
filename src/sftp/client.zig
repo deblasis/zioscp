@@ -203,17 +203,19 @@ pub fn Session(comptime Duplex: type) type {
         }
 
         pub fn write(self: *Self, handle: []const u8, offset: u64, data: []const u8) Error!void {
+            try self.sendWriteUnacked(handle, offset, data);
+            try self.awaitAnyOk();
+        }
+
+        /// Send a WRITE without waiting for the STATUS reply (for pipelining).
+        /// Header from a stack buffer + payload streamed straight to the wire.
+        pub fn sendWriteUnacked(self: *Self, handle: []const u8, offset: u64, data: []const u8) Error!void {
             const id = self.allocId();
-            // Hot path: WRITE header from a stack buffer + the payload streamed
-            // straight to the wire. Avoids the per-write Allocating writer (one
-            // ~32 KiB alloc + an extra copy of the payload per chunk), which the
-            // benchmark showed was the bulk of zioscp-j1's overhead vs scp.
             var hdr: [256]u8 = undefined;
             var hw = std.Io.Writer.fixed(&hdr);
             packets.encodeWriteHeader(&hw, id, handle, offset, data.len) catch {
                 // Oversized handle: fall back to the allocating encode path.
                 try self.send(packets.encodeWrite, .{ id, handle, offset, data });
-                try self.expectOk(id);
                 return;
             };
             self.dup.writeAll(hdr[0..hw.end]) catch |err| switch (err) {
@@ -226,7 +228,22 @@ pub fn Session(comptime Duplex: type) type {
                     else => return error.IoClosed,
                 };
             }
-            try self.expectOk(id);
+        }
+
+        /// Await one STATUS reply and require it OK. For pipelining: SFTP
+        /// processes requests FIFO, so draining N replies after N sends acks
+        /// them in order without matching ids.
+        pub fn awaitAnyOk(self: *Self) Error!void {
+            const payload = try self.recv();
+            defer self.gpa.free(payload);
+            const h = packets.decodeHeader(payload) catch |e| return mapDecodeErr(e);
+            switch (h.type) {
+                .status => {
+                    const code = try decodeStatus(h.body);
+                    if (code != .ok) return statusToError(code);
+                },
+                else => return error.UnexpectedResponse,
+            }
         }
 
         pub fn fsetstat(self: *Self, handle: []const u8, attrs: Attrs) Error!void {

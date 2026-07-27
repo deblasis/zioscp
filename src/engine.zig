@@ -197,19 +197,35 @@ pub fn uploadFile(
     defer gpa.free(handle);
     errdefer sess.close(handle) catch {};
 
-    const buf = try gpa.alloc(u8, effectiveChunk(opts));
+    const chunk = effectiveChunk(opts);
+    const buf = try gpa.alloc(u8, chunk);
     defer gpa.free(buf);
+    // Sliding-window pipeline: keep up to `window` WRITEs in flight. SFTP
+    // processes FIFO and STATUS replies are tiny, so a single-threaded fill/
+    // drain keeps the server's write path saturated with no pipe-buffer
+    // deadlock risk (the benchmark showed serialization was zioscp-j1's main
+    // overhead vs scp). Sidecar records the byte offset of acknowledged writes.
+    const window: usize = 16;
     var off = next_off;
+    var in_flight: usize = 0;
+    var acked_writes: u64 = if (chunk > 0) next_off / @as(u64, chunk) else 0;
     var prog = Progress.start(io, remote_path, total, opts, next_off);
-    var pacer = Pacer.init(io, opts, effectiveChunk(opts));
-    while (off < total) {
-        pacer.wait();
-        const len: usize = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
-        _ = try local.readPositionalAll(io, buf[0..len], off);
-        try sess.write(handle, off, buf[0..len]);
-        off += len;
-        record(io, gpa, sidecar, .upload, total, effectiveChunk(opts), off, local_path);
-        prog.step(len);
+    var pacer = Pacer.init(io, opts, chunk);
+    while (off < total or in_flight > 0) {
+        while (in_flight < window and off < total) {
+            pacer.wait();
+            const len: usize = @intCast(@min(@as(u64, chunk), total - off));
+            _ = try local.readPositionalAll(io, buf[0..len], off);
+            try sess.sendWriteUnacked(handle, off, buf[0..len]);
+            off += len;
+            in_flight += 1;
+        }
+        try sess.awaitAnyOk();
+        in_flight -= 1;
+        acked_writes += 1;
+        const acked_off: u64 = @min(acked_writes * @as(u64, chunk), total);
+        record(io, gpa, sidecar, .upload, total, chunk, acked_off, local_path);
+        prog.step(chunk);
     }
     prog.finish();
     if (opts.preserve) {
