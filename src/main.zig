@@ -26,6 +26,7 @@ const usage =
     \\  -i KEY           identity file
     \\  -r               copy directories recursively
     \\  -p               preserve file permissions
+    \\  --bwlimit BPS    limit transfer to BPS bytes/sec (default unlimited)
     \\  --chunk-size N   transfer chunk size in bytes (default 8 MiB)
     \\  --no-resume      overwrite from the start instead of resuming
     \\  -h, --help       show this help
@@ -63,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
     var resume_enabled = true;
     var recursive = false;
     var preserve = false;
+    var bwlimit_bps: u64 = 0;
     var positionals: [2][]const u8 = .{ "", "" };
     var npos: usize = 0;
 
@@ -82,6 +84,10 @@ pub fn main(init: std.process.Init) !void {
             identity = args[i];
         } else if (std.mem.eql(u8, a, "--no-resume")) {
             resume_enabled = false;
+        } else if (std.mem.eql(u8, a, "--bwlimit")) {
+            i += 1;
+            if (i >= args.len) bail("{s}", .{usage});
+            bwlimit_bps = std.fmt.parseInt(u64, args[i], 10) catch bail("bad --bwlimit (bytes/sec)", .{});
         } else if (std.mem.eql(u8, a, "-r")) {
             recursive = true;
         } else if (std.mem.eql(u8, a, "-p")) {
@@ -131,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
     ssh_argv.append(aa, spec.user_host) catch bail("oom", .{});
     ssh_argv.append(aa, "sftp") catch bail("oom", .{});
 
-    const opts: engine.Options = .{ .chunk_size = chunk_size, .resume_enabled = resume_enabled, .preserve = preserve };
+    const opts: engine.Options = .{ .chunk_size = chunk_size, .resume_enabled = resume_enabled, .preserve = preserve, .bwlimit_bps = bwlimit_bps };
 
     var conn = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
         bail("connection failed: {s}", .{@errorName(err)});

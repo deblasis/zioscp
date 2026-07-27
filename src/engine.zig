@@ -12,6 +12,7 @@ const client = @import("sftp/client.zig");
 const packets = @import("sftp/packets.zig");
 const resume_mod = @import("resume.zig");
 const zioprogress = @import("zioprogress");
+const ziorate = @import("ziorate");
 
 const Dir = std.Io.Dir;
 const Session = client.Session;
@@ -21,8 +22,50 @@ pub const Options = struct {
     resume_enabled: bool = true,
     /// Render a progress bar to stderr (only when stderr is a TTY).
     progress: bool = true,
+    /// Max bytes/sec (0 = unlimited). Paced at chunk granularity via ziorate.
+    bwlimit_bps: u64 = 0,
     /// Apply source permissions/mtime to the destination. Permission bits only.
     preserve: bool = false,
+};
+
+/// Bandwidth pacer. ziorate's TokenBucket is per-token, so we treat one token
+/// as one chunk: a bucket of capacity 1 refilling at (bwlimit / chunk) tokens
+/// per second bounds the transfer to bwlimit bytes/sec. Disabled when
+/// bwlimit_bps is 0.
+const Pacer = struct {
+    bucket: ziorate.TokenBucket,
+    io: std.Io,
+    enabled: bool,
+    interval_ns: i96, // ns to sleep when waiting for the next token
+
+    fn init(io: std.Io, opts: Options, chunk: u32) Pacer {
+        const enabled = opts.bwlimit_bps > 0;
+        const refill: f64 = if (enabled)
+            @as(f64, @floatFromInt(opts.bwlimit_bps)) / @as(f64, @floatFromInt(chunk))
+        else
+            0;
+        const interval: i96 = if (enabled)
+            @intCast(@divTrunc(@as(u64, chunk) * 1_000_000_000, opts.bwlimit_bps))
+        else
+            0;
+        return .{
+            .bucket = ziorate.TokenBucket.init(1, refill),
+            .io = io,
+            .enabled = enabled,
+            .interval_ns = interval,
+        };
+    }
+
+    /// Block until one chunk's worth of bandwidth is available.
+    fn wait(self: *Pacer) void {
+        if (!self.enabled) return;
+        while (true) {
+            const ts = std.Io.Clock.now(.awake, self.io);
+            self.bucket.refill(@intCast(ts.nanoseconds));
+            if (self.bucket.allow()) return;
+            std.Io.sleep(self.io, .{ .nanoseconds = self.interval_ns }, .awake) catch {};
+        }
+    }
 };
 
 fn stderrIsTty(io: std.Io) bool {
@@ -156,7 +199,9 @@ pub fn uploadFile(
     defer gpa.free(buf);
     var off = next_off;
     var prog = Progress.start(io, remote_path, total, opts, next_off);
+    var pacer = Pacer.init(io, opts, effectiveChunk(opts));
     while (off < total) {
+        pacer.wait();
         const len: usize = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
         _ = try local.readPositionalAll(io, buf[0..len], off);
         try sess.write(handle, off, buf[0..len]);
@@ -206,7 +251,9 @@ pub fn downloadFile(
     defer gpa.free(buf);
     var off = next_off;
     var prog = Progress.start(io, local_path, total, opts, next_off);
+    var pacer = Pacer.init(io, opts, effectiveChunk(opts));
     while (off < total) {
+        pacer.wait();
         const want: u32 = @intCast(@min(@as(u64, effectiveChunk(opts)), total - off));
         const piece = sess.read(rh, off, want) catch |err| switch (err) {
             error.Eof => break,

@@ -16,6 +16,10 @@
             .url = "https://github.com/deblasis/zioprogress/archive/refs/heads/master.tar.gz",
             .hash = "zioprogress-0.1.0-KCfsjP00AAAl6YQOhdamuchhlUTwJwmLOpRxtgM4hI8d",
         },
+        .ziorate = .{
+            .url = "https://github.com/deblasis/ziorate/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "ziorate-0.2.0-ZNPvJ_E4AAC8qiycrfhyjpZqmtg12HbCSLSi5m5AIdpJ",
+        },
     },
     .paths = .{
         "build.zig",
