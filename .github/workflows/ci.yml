@@ -14,13 +14,10 @@ jobs:
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.16.0
-      - name: fmt
-        run: zig fmt --check src/ build.zig
-      - name: build
-        run: zig build
-      - name: unit tests
-        run: zig build test
-      - name: cross-compile x86_64-linux-gnu
-        run: zig build -Dtarget=x86_64-linux-gnu
-      # The SFTP integration tests (zig build integration) need a Docker
-      # openssh-server harness; run them locally via tests/sftp-integration.sh.
+      - name: install just
+        run: curl -sSL https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+      # CI runs exactly what `just ci` runs locally (fmt-check + build + tests +
+      # the cross-compile matrix). The Docker SFTP integration suite is
+      # `just integration`, kept out of `ci` so it stays fast + network-free.
+      - name: ci
+        run: just ci
