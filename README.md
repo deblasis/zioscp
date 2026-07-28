@@ -17,9 +17,10 @@ single-file chunked). Works against any unmodified `sshd`.
   - `-r -j N` fans a directory tree across N ssh connections (file-level).
   - `-j N` on a single large file shards it at offset ranges across N
     connections (chunked concurrent writes/reads).
-- **Pipelined single stream**: the upload path keeps a window of SFTP WRITEs in
-  flight, so `zioscp -j1` saturates the server and beats stock `scp` on large
-  uploads even at zero added latency.
+- **Pipelined single stream**: the upload/download paths keep an **adaptive,
+  BDP-sized** window of SFTP requests in flight (sized from how long each ack
+  recv blocks, not a fixed constant), so `zioscp -j1` saturates the server and
+  beats stock `scp` on large transfers even at zero added latency.
 - **Bandwidth limiting** (`--bwlimit`, paced at chunk granularity), **progress
   bar** (TTY-gated), **`-v`** per-file logging, and **permission + mtime
   preservation** (`-p`).
@@ -86,10 +87,12 @@ zioscp's lean collect-then-transfer beats scp's chattier recursive protocol.
 The wide-area-network speedup is measured by `tests/bench-latency.sh`, which
 runs on a Linux host with `tc netem` (it injects RTT on the loopback; the
 control session rides a different interface). Representative result at 100 ms
-RTT, 50 files: `scp -r` 28 s vs `zioscp -r -j4` 7.7 s (**3.7x faster**).
-Single-file upload and download both beat scp under latency too, because both
-keep a large window of SFTP requests in flight (the download pipeline relies on
-ssh's internal buffering to absorb large DATA responses without a deadlock).
+RTT, 100 files: `scp -r` ~53 s vs `zioscp -r -j4` ~11 s (**~4.7x faster**);
+single-file upload and download both match or beat scp under latency. Both
+pipelines grow an adaptive window of SFTP requests to the bandwidth-delay
+product (the download pipeline relies on ssh's internal buffering to absorb
+large DATA responses without a deadlock). Absolute times vary by host; the
+ratios are the stable signal.
 
 ## Design
 

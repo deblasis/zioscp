@@ -120,6 +120,77 @@ const Progress = struct {
     }
 };
 
+/// Adaptive sliding-window controller for the SFTP pipeline. Sizes the in-flight
+/// window to the bandwidth-delay product without timing per-request RTT: it
+/// watches how long each ack RECV blocks. A recv that returns near-instantly had
+/// its reply already buffered (the pipe was full -> window already covers the
+/// BDP); a recv that blocks waited on the network (the pipe drained -> window is
+/// below BDP -> grow). This sidesteps the trap that derails RTT-ratio (Vegas)
+/// controllers in this pipeline: the single-threaded recv+process loop inflates
+/// a request's measured RTT with the local disk/hash work on EARLIER replies,
+/// which reads as queueing and falsely caps the window (a measured regression on
+/// downloads). recv-wait is clean -- that work happens AFTER recv returns.
+/// Replaces a fixed window (was 256 single-stream / 64 per chunk worker).
+const WindowCtl = struct {
+    window: usize,
+    min_window: usize,
+    max_window: usize,
+    ss_thresh: usize, // slow-start threshold (chunks)
+
+    const immediate_ns: i96 = 100_000; // <= ~100us => the reply was already buffered
+
+    fn init(min_window: usize, max_window: usize) WindowCtl {
+        return .{
+            .window = min_window,
+            .min_window = min_window,
+            .max_window = max_window,
+            .ss_thresh = max_window,
+        };
+    }
+
+    /// Record one ack, given the nanoseconds its RECV spent blocked waiting.
+    /// A buffered reply (wait <= immediate_ns) means the pipe was full -> window
+    /// already covers the BDP, hold. A blocking recv means the pipe drained ->
+    /// window is below BDP, grow. Slow-start (double) below ss_thresh, +1 above.
+    /// No shrink: in this single-threaded pipeline there is no clean congestion
+    /// signal, and a window above BDP just buffers (harmless, capped at max).
+    fn observedWait(self: *WindowCtl, wait_ns: i96) void {
+        if (wait_ns >= 0 and wait_ns <= immediate_ns) return; // buffered: hold
+        if (self.window >= self.max_window) return;
+        if (self.window < self.ss_thresh) {
+            self.window = @min(self.window * 2, self.max_window); // slow-start
+        } else {
+            self.window = @min(self.window + 1, self.max_window); // avoidance
+        }
+    }
+};
+
+test "WindowCtl: grows on blocking recvs, holds once the pipe is full" {
+    var w = WindowCtl.init(4, 2048);
+    // Blocking recvs (wait well past immediate_ns): pipe draining -> grow.
+    var i: usize = 0;
+    while (i < 6) : (i += 1) w.observedWait(50_000_000); // 50 ms blocks
+    try std.testing.expect(w.window >= 64); // slow-start doubled several times
+    try std.testing.expect(w.window < 2048); // not yet at max
+    const held = w.window;
+    // Buffered recvs (wait <= immediate_ns): pipe full -> stop growing.
+    var j: usize = 0;
+    while (j < 100) : (j += 1) w.observedWait(5_000); // ~5 us (buffered)
+    try std.testing.expectEqual(held, w.window); // held, did not keep climbing
+    try std.testing.expect(w.window < 2048);
+}
+
+test "WindowCtl: resumes growth if the pipe drains again" {
+    var w = WindowCtl.init(8, 2048);
+    while (w.window < 64) w.observedWait(50_000_000); // ramp via blocking recvs
+    var k: usize = 0;
+    while (k < 16) : (k += 1) w.observedWait(1_000); // fill the streak -> hold
+    const plateau = w.window;
+    w.observedWait(80_000_000); // a blocking recv: pipe drained again
+    w.observedWait(80_000_000);
+    try std.testing.expect(w.window > plateau); // grew again
+}
+
 /// SFTP v3 guarantees servers can process packets with at least ~34000 bytes
 /// of payload; OpenSSH caps near 256 KB. Keep each WRITE/READ payload well
 /// under that so a single packet never exceeds the server's max. The user's
@@ -212,23 +283,22 @@ pub fn uploadFile(
     const chunk = effectiveChunk(opts);
     const buf = try gpa.alloc(u8, chunk);
     defer gpa.free(buf);
-    // Sliding-window pipeline: keep up to `window` WRITEs in flight. SFTP
-    // processes FIFO and STATUS replies are tiny, so a single-threaded fill/
-    // drain keeps the server's write path saturated with no pipe-buffer
-    // deadlock risk. The window sets the in-flight bytes (window * chunk) and
-    // thus the bandwidth-delay product the single stream can cover: at 16 it
-    // capped throughput on high-RTT links (the latency benchmark on ubuntinovm
-    // showed zioscp-j1 losing to scp at 100ms RTT). 256 * 32 KiB = 8 MiB covers
-    // ~80 MB/s at 100ms RTT, comfortably past scp, at no extra client memory
-    // (one reused buf). Sidecar records the byte offset of acknowledged writes.
-    const window: usize = 256;
+    // Sliding-window pipeline: keep up to `win.window` WRITEs in flight. SFTP
+    // processes FIFO and STATUS replies are tiny, so a single-threaded fill/drain
+    // keeps the server's write path saturated with no pipe-buffer deadlock risk.
+    // The window sizes itself to the bandwidth-delay product (WindowCtl, which
+    // grows while ack recvs block on the network and holds once the pipe is full);
+    // the SSH channel window caps in-flight data anyway.
+    // One reused buf, so the window costs no extra client memory. The sidecar
+    // records the byte offset of acknowledged writes.
+    var win = WindowCtl.init(16, 512);
     var off = next_off;
     var in_flight: usize = 0;
     var acked_writes: u64 = if (chunk > 0) next_off / @as(u64, chunk) else 0;
     var prog = Progress.start(io, remote_path, total, opts, next_off);
     var pacer = Pacer.init(io, opts, chunk);
     while (off < total or in_flight > 0) {
-        while (in_flight < window and off < total) {
+        while (in_flight < win.window and off < total) {
             pacer.wait();
             const len: usize = @intCast(@min(@as(u64, chunk), total - off));
             _ = try local.readPositionalAll(io, buf[0..len], off);
@@ -236,6 +306,7 @@ pub fn uploadFile(
             off += len;
             in_flight += 1;
         }
+        const wa0 = std.Io.Clock.now(.awake, io).nanoseconds;
         sess.awaitAnyOk() catch |err| {
             // awaitAnyOk consumed one reply (a bad status, e.g. ENOSPC) or the
             // link died. Best-effort drain the remaining outstanding replies so
@@ -246,6 +317,7 @@ pub fn uploadFile(
             while (in_flight > 0) : (in_flight -= 1) sess.awaitAnyOk() catch {};
             return err;
         };
+        win.observedWait(std.Io.Clock.now(.awake, io).nanoseconds - wa0);
         in_flight -= 1;
         acked_writes += 1;
         const acked_off: u64 = @min(acked_writes * @as(u64, chunk), total);
@@ -310,27 +382,29 @@ pub fn downloadFile(
         try Dir.cwd().createFile(io, local_path, .{ .truncate = false });
     defer local.close(io);
 
-    // Pipelined download: keep up to `window` READs in flight to hide RTT,
+    // Pipelined download: keep up to `win.window` READs in flight to hide RTT,
     // mirroring the upload pipeline. SFTP processes requests FIFO, so the Nth
     // DATA reply corresponds to the Nth READ; `write_off` tracks where the next
     // reply lands. OpenSSH's ssh buffers DATA internally when the stdout pipe
     // is full (flow control, not a deadlock), so a single-threaded fill/drain
-    // keeps the server's read path saturated under high RTT.
+    // keeps the server's read path saturated under high RTT. The window sizes
+    // itself via ack-recv wait time (WindowCtl).
     const chunk = effectiveChunk(opts);
-    const window: usize = 256;
+    var win = WindowCtl.init(16, 512);
     var read_off: u64 = next_off;
     var write_off: u64 = next_off;
     var in_flight: usize = 0;
     var prog = Progress.start(io, local_path, total, opts, next_off);
     var pacer = Pacer.init(io, opts, chunk);
     while (read_off < total or in_flight > 0) {
-        while (in_flight < window and read_off < total) {
+        while (in_flight < win.window and read_off < total) {
             pacer.wait();
             const want: u32 = @intCast(@min(@as(u64, chunk), total - read_off));
             try sess.sendReadUnacked(rh, read_off, want);
             read_off += want;
             in_flight += 1;
         }
+        const wa0 = std.Io.Clock.now(.awake, io).nanoseconds;
         const piece = sess.recvData() catch |err| {
             // recvData consumed one reply (or the link died). Best-effort drain
             // the remaining in-flight replies so a recoverable failure does not
@@ -339,6 +413,7 @@ pub fn downloadFile(
             while (in_flight > 0) : (in_flight -= 1) _ = sess.recvData() catch {};
             return err;
         };
+        win.observedWait(std.Io.Clock.now(.awake, io).nanoseconds - wa0);
         in_flight -= 1;
         try local.writePositionalAll(io, piece, write_off);
         // Record this chunk's MAC for integrity-checked resume.
@@ -682,15 +757,16 @@ fn uploadChunkWorker(comptime Opener: type, ctx: *ChunkCtx(Opener)) void {
     defer local.close(io);
     const buf = ctx.gpa.alloc(u8, ctx.chunk) catch return;
     defer ctx.gpa.free(buf);
-    // Pipeline within the worker: keep up to `window` WRITEs in flight over
+    // Pipeline within the worker: keep up to `win.window` WRITEs in flight over
     // this connection, mirroring the single-stream upload pipeline so a chunked
     // -j transfer also hides RTT. `inflight` is the FIFO of chunk indices whose
-    // STATUS replies are outstanding (each marked done in the bitmap on ack).
-    const window: usize = 64;
+    // STATUS replies are outstanding (each marked done in the bitmap on ack); the
+    // window sizes itself via ack-recv wait time (WindowCtl).
+    var win = WindowCtl.init(8, 128);
     var inflight: std.ArrayList(usize) = .empty;
     defer inflight.deinit(ctx.gpa);
     while (true) {
-        while (inflight.items.len < window) {
+        while (inflight.items.len < win.window) {
             const idx = ctx.next.fetchAdd(1, .monotonic);
             if (idx >= ctx.count) break;
             if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
@@ -710,6 +786,7 @@ fn uploadChunkWorker(comptime Opener: type, ctx: *ChunkCtx(Opener)) void {
             };
         }
         if (inflight.items.len == 0) break;
+        const wa0 = std.Io.Clock.now(.awake, io).nanoseconds;
         conn.sess.awaitAnyOk() catch {
             // Link in trouble: drain the remaining outstanding replies and stop.
             var n = inflight.items.len;
@@ -718,6 +795,7 @@ fn uploadChunkWorker(comptime Opener: type, ctx: *ChunkCtx(Opener)) void {
             _ = ctx.errors.fetchAdd(@intCast(inflight.items.len), .monotonic);
             return;
         };
+        win.observedWait(std.Io.Clock.now(.awake, io).nanoseconds - wa0);
         const done_idx = inflight.orderedRemove(0);
         resume_mod.markChunkDone(io, ctx.bitmap_path, done_idx) catch {};
     }
@@ -736,15 +814,16 @@ fn downloadChunkWorker(comptime Opener: type, ctx: *ChunkCtx(Opener)) void {
     }
     var local = std.Io.Dir.cwd().createFile(io, ctx.local_path, .{ .truncate = false }) catch return;
     defer local.close(io);
-    // Pipeline within the worker: keep up to `window` READs in flight, mirroring
-    // the single-stream download pipeline. `inflight` is the FIFO of chunk
-    // indices whose DATA replies are outstanding; each reply lands at its
-    // chunkRange offset and is marked done in the bitmap.
-    const window: usize = 64;
+    // Pipeline within the worker: keep up to `win.window` READs in flight,
+    // mirroring the single-stream download pipeline. `inflight` is the FIFO of
+    // chunk indices whose DATA replies are outstanding; each reply lands at its
+    // chunkRange offset and is marked done in the bitmap. The window sizes itself
+    // via ack-recv wait time (WindowCtl).
+    var win = WindowCtl.init(8, 128);
     var inflight: std.ArrayList(usize) = .empty;
     defer inflight.deinit(ctx.gpa);
     while (true) {
-        while (inflight.items.len < window) {
+        while (inflight.items.len < win.window) {
             const idx = ctx.next.fetchAdd(1, .monotonic);
             if (idx >= ctx.count) break;
             if (resume_mod.chunkDone(ctx.done, idx)) continue; // already done in a prior run
@@ -760,12 +839,14 @@ fn downloadChunkWorker(comptime Opener: type, ctx: *ChunkCtx(Opener)) void {
             };
         }
         if (inflight.items.len == 0) break;
+        const wa0 = std.Io.Clock.now(.awake, io).nanoseconds;
         const piece = conn.sess.recvData() catch {
             var n = inflight.items.len;
             while (n > 0) : (n -= 1) _ = conn.sess.recvData() catch {};
             _ = ctx.errors.fetchAdd(@intCast(inflight.items.len + 1), .monotonic);
             return;
         };
+        win.observedWait(std.Io.Clock.now(.awake, io).nanoseconds - wa0);
         const idx = inflight.orderedRemove(0);
         const r = chunker.chunkRange(idx, ctx.total, ctx.chunk);
         if (piece.len == 0) {
