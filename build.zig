@@ -99,6 +99,7 @@ pub fn build(b: *std.Build) void {
         exe_mod.addObjectFile(b.path(p_ssh2));
         exe_mod.addObjectFile(b.path(p_ssl));
         exe_mod.addObjectFile(b.path(p_crypto));
+        exe_mod.linkSystemLibrary("c", .{}); // libc (extern "c" fns; sets link_libc)
         exe.step.dependOn(&vendor_run.step); // ensure the C libs are built before linking
         switch (ti.os.tag) {
             .macos => {
