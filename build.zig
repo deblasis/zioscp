@@ -4,9 +4,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // SSH transport backend: "ssh" (default) drives a system ssh subprocess;
-    // "libssh2" links libssh2 for a self-contained binary (no ssh dependency).
-    const backend = b.option(enum { ssh, libssh2 }, "backend", "SSH transport backend") orelse .ssh;
+    // SSH transport backend: "ssh" drives a system ssh subprocess; "libssh2"
+    // links libssh2 for a self-contained binary (no ssh dependency).
+    // Default is libssh2 on Windows and ssh elsewhere. The ssh-subprocess
+    // backend relies on driving `ssh -s sftp` over its piped stdio, which does
+    // not work on Windows: std.Io's subprocess pipes are overlapped named pipes
+    // that readStreaming returns EOF on before data arrives, and Windows
+    // ssh.exe does not serve a usable SFTP stream over `-s sftp` pipes. The
+    // libssh2 backend (which builds its own winsock socket on Windows) is the
+    // working, self-contained option there.
+    const default_backend: enum { ssh, libssh2 } =
+        if (target.result.os.tag == .windows) .libssh2 else .ssh;
+    const Backend = @TypeOf(default_backend);
+    const backend = b.option(Backend, "backend", "SSH transport backend") orelse default_backend;
 
     // Fleet dependencies (published tarballs).
     const ziocrypt_mod = b.dependency("ziocrypt", .{

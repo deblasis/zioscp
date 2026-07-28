@@ -24,9 +24,117 @@ fn mapLe(err: libssh2.Error) Error {
     };
 }
 
-/// Resolve + connect a TCP socket, returning the raw fd for libssh2 and the
-/// stream (for closing later). Tries an IP literal first, then DNS.
-fn dial(io: std.Io, host: []const u8, port: u16) Error!std.Io.net.Stream {
+/// The OS socket libssh2 reads/writes on, plus how to close it. On POSIX this
+/// is a std.Io.net.Stream (a real fd); on Windows it is a raw winsock SOCKET —
+/// see `winsock` below for why std.Io.net can't be used there.
+const Link = if (builtin.os.tag == .windows) usize else std.Io.net.Stream;
+
+/// The raw OS socket value libssh2 wants (SOCKET/usize on Windows, fd on POSIX).
+fn linkArg(link: Link) libssh2.SocketArg {
+    return if (builtin.os.tag == .windows)
+        link
+    else
+        @intCast(link.socket.handle);
+}
+
+fn linkClose(link: Link, io: std.Io) void {
+    if (builtin.os.tag == .windows) {
+        _ = winsock.closesocket(link);
+    } else {
+        link.close(io);
+    }
+}
+
+/// On Windows, std.Io.net opens a raw `\Device\Afd\Endpoint` handle via
+/// NtCreateFile and does all I/O through `IOCTL AFD.*` (the libuv/Node model).
+/// libssh2 calls winsock `send()`/`recv()`, which only work on a genuine
+/// `socket()`-created SOCKET — so we must build one ourselves (blocking, like a
+/// normal client) and hand it to libssh2. Resolution uses winsock `getaddrinfo`
+/// so DNS + literals both work, scp/ssh-faithful.
+const winsock = if (builtin.os.tag == .windows) struct {
+    const ws2 = std.os.windows.ws2_32;
+
+    extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSAData) i32;
+    extern "ws2_32" fn socket(af: i32, typ: i32, protocol: i32) usize;
+    extern "ws2_32" fn connect(s: usize, name: *const ws2.sockaddr, namelen: i32) i32;
+    extern "ws2_32" fn closesocket(s: usize) i32;
+    extern "ws2_32" fn getaddrinfo(
+        node: [*:0]const u8,
+        service: [*:0]const u8,
+        hints: ?*const AddrInfo,
+        result: *?*AddrInfo,
+    ) i32;
+    extern "ws2_32" fn freeaddrinfo(ai: *AddrInfo) void;
+
+    const INVALID_SOCKET: usize = ~@as(usize, 0);
+    const AF_UNSPEC: i32 = 0;
+    const SOCK_STREAM: i32 = 1;
+    const WSAData = extern struct {
+        wVersion: u16,
+        wHighVersion: u16,
+        iMaxSockets: u16,
+        iMaxUdpDg: u16,
+        lpVendorInfo: ?[*:0]u8,
+        szDescription: [257]u8,
+        szSystemStatus: [129]u8,
+    };
+    const AddrInfo = extern struct {
+        flags: i32,
+        family: i32,
+        socktype: i32,
+        protocol: i32,
+        addrlen: usize,
+        canonname: ?[*:0]u8,
+        addr: ?*ws2.sockaddr,
+        next: ?*AddrInfo,
+    };
+
+    var started = false;
+    fn ensureStarted() void {
+        if (started) return;
+        var data: WSAData = undefined;
+        _ = WSAStartup(0x0202, &data); // request WinSock 2.2
+        started = true;
+    }
+
+    /// Resolve + connect a blocking stream socket (first working addr wins).
+    fn dial(host: []const u8, port: u16) !usize {
+        ensureStarted();
+        var port_buf: [16]u8 = undefined;
+        const port_z = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.BadPort;
+        var host_buf: [256]u8 = undefined;
+        if (host.len >= host_buf.len) return error.NameTooLong;
+        @memcpy(host_buf[0..host.len], host);
+        host_buf[host.len] = 0;
+        const host_z: [*:0]const u8 = @ptrCast(&host_buf);
+
+        var hints: AddrInfo = std.mem.zeroes(AddrInfo);
+        hints.family = AF_UNSPEC;
+        hints.socktype = SOCK_STREAM;
+        var res: ?*AddrInfo = null;
+        if (getaddrinfo(host_z, port_z, &hints, &res) != 0) return error.ResolveFailed;
+        defer if (res) |r| freeaddrinfo(r);
+
+        var it = res;
+        while (it) |ai| : (it = ai.next) {
+            const s = socket(ai.family, ai.socktype, ai.protocol);
+            if (s == INVALID_SOCKET) continue;
+            const addr = ai.addr orelse continue;
+            // Fresh winsock sockets are blocking; connect() returns 0 once
+            // established (or falls through to try the next addr on failure).
+            if (connect(s, addr, @intCast(ai.addrlen)) == 0) return s;
+            _ = closesocket(s);
+        }
+        return error.ConnectFailed;
+    }
+} else struct {};
+
+/// Resolve + connect a TCP socket for libssh2, returning the OS-native socket.
+/// POSIX uses std.Io.net (IP literal first, then DNS); Windows uses raw winsock.
+fn dial(io: std.Io, host: []const u8, port: u16) Error!Link {
+    if (builtin.os.tag == .windows) {
+        return winsock.dial(host, port) catch return error.IoClosed;
+    }
     if (std.Io.net.IpAddress.resolve(io, host, port)) |addr| {
         var a = addr;
         return a.connect(io, .{ .mode = .stream }) catch return error.IoClosed;
@@ -39,7 +147,7 @@ pub const DuplexLibssh2 = struct {
     io: std.Io,
     session: *libssh2.SESSION,
     channel: *libssh2.CHANNEL,
-    stream: std.Io.net.Stream,
+    link: Link,
 
     /// Write all bytes (blocking loop). Any libssh2 failure -> IoClosed.
     pub fn writeAll(self: *DuplexLibssh2, bytes: []const u8) Error!void {
@@ -64,7 +172,7 @@ pub const DuplexLibssh2 = struct {
     pub fn deinit(self: *DuplexLibssh2) void {
         libssh2.close(self.channel);
         libssh2.disconnect(self.session);
-        self.stream.close(self.io);
+        linkClose(self.link, self.io);
     }
 };
 
@@ -92,15 +200,13 @@ pub const Connection = struct {
         libssh2.init() catch return error.IoClosed;
         errdefer libssh2.deinit();
 
-        const stream = dial(io, host, port) catch return error.IoClosed;
-        errdefer stream.close(io);
+        const link = dial(io, host, port) catch return error.IoClosed;
+        errdefer linkClose(link, io);
         // libssh2 takes the raw OS socket: an fd (c_int) on POSIX, a SOCKET
-        // (usize) on Windows where fd_t is a HANDLE. std.Io.net exposes it as
-        // the platform fd_t either way.
-        const sock: libssh2.SocketArg = if (builtin.os.tag == .windows)
-            @intFromPtr(stream.socket.handle)
-        else
-            @intCast(stream.socket.handle);
+        // (usize) on Windows. POSIX gets it from std.Io.net's stream; Windows
+        // gets a genuine winsock SOCKET (dial builds one directly — std.Io.net's
+        // AFD handle is unusable by libssh2's winsock send/recv).
+        const sock: libssh2.SocketArg = linkArg(link);
 
         const session = libssh2.newSession() catch return error.IoClosed;
         errdefer libssh2.disconnect(session);
@@ -138,7 +244,7 @@ pub const Connection = struct {
         errdefer libssh2.close(channel);
 
         const dup = gpa.create(DuplexLibssh2) catch return error.OutOfMemory;
-        dup.* = .{ .io = io, .session = session, .channel = channel, .stream = stream };
+        dup.* = .{ .io = io, .session = session, .channel = channel, .link = link };
         var sess = client.Session(DuplexLibssh2).init(gpa, dup);
         _ = sess.handshake() catch {
             dup.deinit();
