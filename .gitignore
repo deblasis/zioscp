@@ -5,3 +5,7 @@ tests/keys/
 zig-pkg/
 zioscp_*
 *.zioscppart
+
+# vendored libssh2+openssl (built by tools/vendor-libssh2.sh)
+vendor/
+.vendor-build/

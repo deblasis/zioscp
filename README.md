@@ -35,19 +35,30 @@ just ci            # fmt-check + build + test (what CI runs)
 ### Transport backend
 
 The default (`-Dbackend=ssh`, the default) drives a system `ssh` subprocess, so
-it works anywhere `ssh` is installed. An experimental self-contained backend
-that links libssh2 directly (no `ssh` dependency) is available:
+it works anywhere `ssh` is installed. A **self-contained** backend that links
+libssh2 directly (no `ssh` dependency at all) is also available:
 
 ```
-zig build -Dbackend=libssh2     # links -lssh2 (needs libssh2 on the system)
+zig build -Dbackend=libssh2     # self-contained: no ssh, no libssh2/openssl dylib
 ```
+
+This backend vendors **libssh2 1.11.1 (OpenSSL backend) + OpenSSL 3.6.3** and
+builds both statically with `zig cc`, so the resulting binary has no `ssh`,
+`libssh2`, `libssl`, or `libcrypto` dependency (only the OS runtime). All common
+key types work: **Ed25519, ECDSA, and RSA** public-key auth, plus the
+curve25519 key exchange. `tools/vendor-libssh2.sh` fetches the pinned sources
+and builds them into a gitignored `vendor/<os>-<arch>/`; the build invokes it
+automatically (an idempotent no-op once built). The first `-Dbackend=libssh2`
+build therefore needs `autoconf automake libtool perl make curl` and an internet
+fetch (~a few minutes); later builds are fast.
 
 libssh2 provides only the SSH transport: zioscp opens a channel to the `sftp`
 subsystem and runs its existing SFTP codec over the channel bytes, so all the
-SFTP/resume/pipeline logic is shared. Single-file and recursive (`-r`)
-transfers work; parallel (`-j`) is not yet wired through this backend. It links
-the system libssh2 (vendoring libssh2+crypto for a true single static binary is
-a follow-on).
+SFTP/resume/pipeline logic is shared between the two backends. Single-file and
+recursive (`-r`) transfers work; parallel (`-j`) is not yet wired through this
+backend (single connection). Licensing: OpenSSL is Apache-2.0 and libssh2 is
+BSD-3-Clause, both compatible with zioscp's dual MIT OR Apache-2.0; the upstream
+notices are copied into `vendor/<name>/` when built.
 
 Both backends verify the server host key by default, like scp/ssh under
 BatchMode: an unknown or changed key is refused. `--host-key-check` mirrors

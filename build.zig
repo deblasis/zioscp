@@ -51,11 +51,64 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     if (backend == .libssh2) {
-        // Homebrew (Apple Silicon) puts libssh2.dylib here; pkg-config lookup is
-        // unreliable from the zig build, so point at it directly. Vendoring the
-        // source (slice 2) removes this system dependency.
-        exe_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-        exe_mod.linkSystemLibrary("ssh2", .{}); // -lssh2; implies libc
+        // Self-contained libssh2 backend: link the static, zig-cc-built libssh2
+        // (openssl backend) + OpenSSL, so the binary needs no libssh2/openssl
+        // dylib (only system frameworks + libc, + libz for compression). The C
+        // libraries are built by tools/vendor-libssh2.sh into vendor/<os>-<arch>/.
+        // The `vendor-libssh2` step runs that script (an idempotent no-op once
+        // built); the exe depends on it so the libs exist before linking.
+        const ti = target.result;
+        const ossl_target: ?[]const u8 = switch (ti.os.tag) {
+            .macos => switch (ti.cpu.arch) {
+                .aarch64 => "darwin64-arm64-cc",
+                .x86_64 => "darwin64-x86_64-cc",
+                else => null,
+            },
+            .linux => switch (ti.cpu.arch) {
+                .x86_64 => "linux-x86_64",
+                .aarch64 => "linux-aarch64",
+                else => null,
+            },
+            else => null,
+        };
+        if (ossl_target == null) {
+            std.debug.print("error: libssh2 vendor has no OpenSSL Configure target for {s}-{s}\n", .{ @tagName(ti.os.tag), @tagName(ti.cpu.arch) });
+        }
+        const vendor_name = std.fmt.allocPrint(b.allocator, "{s}-{s}", .{ @tagName(ti.os.tag), @tagName(ti.cpu.arch) }) catch @panic("OOM");
+        const zig_triple = std.fmt.allocPrint(b.allocator, "{s}-{s}", .{
+            @tagName(ti.cpu.arch),
+            switch (ti.os.tag) {
+                .macos => "macos",
+                .linux => "linux-gnu",
+                else => "none",
+            },
+        }) catch @panic("OOM");
+
+        const vendor_run = b.addSystemCommand(&.{
+            "tools/vendor-libssh2.sh",
+            vendor_name,
+            ossl_target orelse "unsupported",
+            zig_triple,
+        });
+        const vendor_step = b.step("vendor-libssh2", "Build vendored libssh2+openssl into vendor/<name>/ (used by -Dbackend=libssh2)");
+        vendor_step.dependOn(&vendor_run.step);
+
+        const p_ssh2 = std.fmt.allocPrint(b.allocator, "vendor/{s}/lib/libssh2.a", .{vendor_name}) catch @panic("OOM");
+        const p_ssl = std.fmt.allocPrint(b.allocator, "vendor/{s}/lib/libssl.a", .{vendor_name}) catch @panic("OOM");
+        const p_crypto = std.fmt.allocPrint(b.allocator, "vendor/{s}/lib/libcrypto.a", .{vendor_name}) catch @panic("OOM");
+        exe_mod.addObjectFile(b.path(p_ssh2));
+        exe_mod.addObjectFile(b.path(p_ssl));
+        exe_mod.addObjectFile(b.path(p_crypto));
+        exe.step.dependOn(&vendor_run.step); // ensure the C libs are built before linking
+        switch (ti.os.tag) {
+            .macos => {
+                exe_mod.linkFramework("Security", .{});
+                exe_mod.linkFramework("CoreFoundation", .{});
+            },
+            else => {},
+        }
+        // No -lz: the vendor script builds libssh2 without zlib (--without-libz-prefix)
+        // and OpenSSL with no-comp, so neither references deflate/inflate.
     }
     b.installArtifact(exe);
 
