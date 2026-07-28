@@ -16,6 +16,7 @@ test:
 # Cross-compile matrix (also what CI runs). Add targets here to extend both.
 cross:
     zig build -Dtarget=x86_64-linux-gnu
+    zig build -Dtarget=x86_64-windows-gnu
 
 # Integration tests against a real sshd (needs the Docker sftp harness).
 integration:

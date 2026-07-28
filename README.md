@@ -30,8 +30,14 @@ single-file chunked). Works against any unmodified `sshd`.
 ```
 zig build          # build the binary -> zig-out/bin/zioscp
 zig build test     # unit tests
-just ci            # fmt-check + build + test (what CI runs)
+just ci            # fmt-check + build + tests + cross matrix (what CI runs)
+just integration   # SFTP round-trip tests vs a Docker sshd (heavier)
 ```
+
+The default (ssh) backend cross-compiles to Linux and Windows from any host
+(`zig build -Dtarget=x86_64-linux-gnu`, `... x86_64-windows-gnu`); on Windows it
+drives the system OpenSSH (`ssh.exe`, shipped with Windows 10+). `just ci` runs
+that cross matrix.
 
 ### Transport backend
 

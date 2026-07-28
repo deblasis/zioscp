@@ -326,17 +326,18 @@ pub fn uploadFile(
     }
     prog.finish();
     if (opts.preserve) {
-        // Permission bits + atime/mtime (SFTP ACMODTIME is u32 seconds). The
-        // local Stat's Timestamps are ns since epoch. Best-effort.
-        const mode = st.permissions.toMode();
+        // atime/mtime (SFTP ACMODTIME is u32 seconds) from the local Stat's ns
+        // timestamps; plus POSIX mode bits where the platform exposes them. On
+        // Windows the permissions enum has no mode mapping, so mtime-only there.
+        const has_mode = @hasDecl(@TypeOf(st.permissions), "toMode");
         const mtime_s: u32 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
         const atime_s: u32 = if (st.atime) |a|
             @intCast(@divTrunc(a.nanoseconds, std.time.ns_per_s))
         else
             mtime_s;
         sess.fsetstat(handle, .{
-            .flags = packets.ATTR_PERMISSIONS | packets.ATTR_ACMODTIME,
-            .permissions = @intCast(mode & 0o7777),
+            .flags = (if (has_mode) packets.ATTR_PERMISSIONS else 0) | packets.ATTR_ACMODTIME,
+            .permissions = if (has_mode) @intCast(st.permissions.toMode() & 0o7777) else 0,
             .atime = atime_s,
             .mtime = mtime_s,
         }) catch {};
