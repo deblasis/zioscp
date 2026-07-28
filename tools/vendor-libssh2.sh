@@ -20,7 +20,7 @@ ZIG_TARGET="${3:-}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 V="$ROOT/vendor/$NAME"
-WORK="$ROOT/.vendor-build"   # gitignored scratch space for the C builds
+WORK="$ROOT/.vendor-build/$NAME"   # per-target scratch space (so targets don't clobber each other)
 mkdir -p "$WORK" "$V/lib" "$V/include"
 
 OSSL_TAG="openssl-3.6.3"          # Apache-2.0
