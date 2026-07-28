@@ -39,6 +39,7 @@ case "$OSSL_TARGET" in
   darwin64-x86_64-cc) tarch=x86_64; tos=darwin ;;
   linux-x86_64)       tarch=x86_64; tos=linux ;;
   linux-aarch64)      tarch=arm64 ; tos=linux ;;
+  mingw64)            tarch=x86_64; tos=windows ;;
   *) tarch= ; tos= ;;
 esac
 CROSS=false
@@ -46,10 +47,11 @@ GNU_HOST=""
 if [ -n "$tarch" ] && { [ "$tarch" != "$barch" ] || [ "$tos" != "$bos" ]; }; then
   CROSS=true
   case "$tarch-$tos" in
-    x86_64-linux)  GNU_HOST="x86_64-pc-linux-gnu" ;;
-    arm64-linux)   GNU_HOST="aarch64-unknown-linux-gnu" ;;
-    x86_64-darwin) GNU_HOST="x86_64-apple-darwin" ;;
-    arm64-darwin)  GNU_HOST="aarch64-apple-darwin" ;;
+    x86_64-linux)   GNU_HOST="x86_64-pc-linux-gnu" ;;
+    arm64-linux)    GNU_HOST="aarch64-unknown-linux-gnu" ;;
+    x86_64-darwin)  GNU_HOST="x86_64-apple-darwin" ;;
+    arm64-darwin)   GNU_HOST="aarch64-apple-darwin" ;;
+    x86_64-windows) GNU_HOST="x86_64-w64-mingw32" ;;
   esac
 fi
 
@@ -68,8 +70,11 @@ if [ ! -f "$V/lib/libcrypto.a" ] || [ ! -f "$V/lib/libssl.a" ]; then
   # --libdir=lib forces lib/ on linux (default lib64) so build.zig finds them.
   CC="$CC" ./Configure "$OSSL_TARGET" no-shared no-module no-tests no-comp \
     --libdir=lib --prefix="$V" > "$WORK/ossl_configure.log" 2>&1
-  make -j"$JOBS" > "$WORK/ossl_make.log" 2>&1
-  make install_sw > "$WORK/ossl_install.log" 2>&1
+  # Build only the libraries, not the openssl CLI app: the app's Windows resource
+  # file needs windres (which zig cc can't provide on mingw), and we only need
+  # libcrypto/libssl + headers anyway. build_libs + install_dev cover all targets.
+  make -j"$JOBS" build_libs > "$WORK/ossl_make.log" 2>&1
+  make install_dev > "$WORK/ossl_install.log" 2>&1
 else
   echo "==> OpenSSL already built, skipping"
 fi
@@ -87,13 +92,29 @@ if [ ! -f "$V/lib/libssh2.a" ]; then
   [ -f configure ] || autoreconf -ivf > "$WORK/libssh2_autoreconf.log" 2>&1
   HOST_ARG=()
   [ "$CROSS" = true ] && [ -n "$GNU_HOST" ] && HOST_ARG=(--host="$GNU_HOST")
+  # AR/RANLIB = zig ar so libtool doesn't default to the MSVC 'lib' librarian on
+  # mingw, and produces GNU-format archives directly (everywhere).
   # --without-libz-prefix keeps libssh2 from pulling in zlib when none is requested.
-  CC="$CC" CFLAGS="-O2 -I$V/include" LDFLAGS="-L$V/lib" LIBS="-lssl -lcrypto -lm" \
+  CC="$CC" AR="zig ar" RANLIB="zig ar s" \
+    CFLAGS="-O2 -I$V/include" LDFLAGS="-L$V/lib" LIBS="-lssl -lcrypto -lm" \
     ./configure "${HOST_ARG[@]}" --with-crypto=openssl --without-libz-prefix \
       --disable-shared --enable-static --prefix="$V" \
       > "$WORK/libssh2_configure.log" 2>&1
-  make -j"$JOBS" > "$WORK/libssh2_make.log" 2>&1
-  make install > "$WORK/libssh2_install.log" 2>&1
+  # libtool guesses MSVC for mingw + a non-gcc CC, baking 'lib -OUT:' (the MSVC
+  # librarian) as the static-archive command. Force the GNU '$AR $AR_FLAGS' form
+  # (AR=zig ar above). No-op on mac/linux where libtool already uses $AR.
+  # -i.bak (not -i): BSD sed (macOS) requires an extension arg for -i.
+  sed -i.bak 's|old_archive_cmds="lib -OUT:[^"]*"|old_archive_cmds="\\$AR \\$AR_FLAGS \\$oldlib\\$oldobjs"|g' libtool
+  rm -f libtool.bak
+  # Build only the library (src/): the example/ programs link OpenSSL legacy
+  # ciphers (RC4/CAST5/DES) we don't build, and aren't needed.
+  make -C src -j"$JOBS" > "$WORK/libssh2_make.log" 2>&1
+  make -C src install > "$WORK/libssh2_install.log" 2>&1
+  cp include/libssh2.h include/libssh2_publickey.h include/libssh2_sftp.h "$V/include/" 2>/dev/null || true
+  # mingw libtool names the static lib libssh2.lib; rename to .a (same archive).
+  if [ -f "$V/lib/libssh2.lib" ] && [ ! -f "$V/lib/libssh2.a" ]; then
+    mv "$V/lib/libssh2.lib" "$V/lib/libssh2.a"
+  fi
 else
   echo "==> libssh2 already built, skipping"
 fi
@@ -113,7 +134,9 @@ if [ "$CROSS" = true ]; then
     case "$first" in __.SYMDEF*) ;; *) continue ;; esac   # already GNU/non-BSD
     echo "==> re-indexing $a to GNU format (zig ar)"
     tmp="$(mktemp -d)"
-    ( cd "$tmp" && ar x "$a" && rm -f __.SYMDEF* "$a" && zig ar --format=gnu rcs "$a" *.o )
+    # Re-archive every extracted member: *.o on Unix, *.obj on Windows (mingw).
+    # nullglob drops a pattern that matches nothing so the bare glob can't fail.
+    ( cd "$tmp" && ar x "$a" && rm -f __.SYMDEF* "$a" && shopt -s nullglob && zig ar --format=gnu rcs "$a" *.o *.obj )
     rm -rf "$tmp"
   done
 fi

@@ -69,6 +69,10 @@ pub fn build(b: *std.Build) void {
                 .aarch64 => "linux-aarch64",
                 else => null,
             },
+            .windows => switch (ti.cpu.arch) {
+                .x86_64 => "mingw64", // mingw-w64 via zig cc (x86_64-windows-gnu)
+                else => null,
+            },
             else => null,
         };
         if (ossl_target == null) {
@@ -80,6 +84,7 @@ pub fn build(b: *std.Build) void {
             switch (ti.os.tag) {
                 .macos => "macos",
                 .linux => "linux-gnu",
+                .windows => "windows-gnu",
                 else => "none",
             },
         }) catch @panic("OOM");
@@ -105,6 +110,14 @@ pub fn build(b: *std.Build) void {
             .macos => {
                 exe_mod.linkFramework("Security", .{});
                 exe_mod.linkFramework("CoreFoundation", .{});
+            },
+            .windows => {
+                // mingw system libs that OpenSSL/libssh2 pull in on Windows.
+                exe_mod.linkSystemLibrary("ws2_32", .{}); // winsock (libssh2 sockets)
+                exe_mod.linkSystemLibrary("advapi32", .{}); // crypto/syscalls
+                exe_mod.linkSystemLibrary("crypt32", .{}); // cert store
+                exe_mod.linkSystemLibrary("bcrypt", .{}); // RNG
+                exe_mod.linkSystemLibrary("gdi32", .{});
             },
             else => {},
         }

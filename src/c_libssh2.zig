@@ -14,6 +14,11 @@ pub const SESSION = opaque {};
 pub const CHANNEL = opaque {};
 pub const KNOWNHOSTS = opaque {};
 
+// libssh2_socket_t: a POSIX fd (c_int) on Unix, a Windows SOCKET (usize) on
+// Windows. The handshake FFI takes this; the transport extracts it from the
+// std.Io socket handle per platform (see transport_libssh2.zig).
+pub const SocketArg = if (@import("builtin").os.tag == .windows) usize else c_int;
+
 // Raw libssh2 entry points. Many "plain" names in libssh2.h are macros that
 // map to these `_ex` symbols with extra length/stream-id params, so the extern
 // declarations target the real `_ex` symbols. Negative returns are errors.
@@ -26,7 +31,7 @@ extern "c" fn libssh2_session_init_ex(
     abstract: ?*anyopaque,
 ) ?*SESSION;
 extern "c" fn libssh2_session_set_blocking(session: *SESSION, blocking: c_int) void;
-extern "c" fn libssh2_session_handshake(session: *SESSION, socket: c_int) c_int;
+extern "c" fn libssh2_session_handshake(session: *SESSION, socket: SocketArg) c_int;
 extern "c" fn libssh2_userauth_publickey_fromfile_ex(
     session: *SESSION,
     username: [*:0]const u8,
@@ -162,7 +167,7 @@ pub fn newSession() Error!*SESSION {
     return libssh2_session_init_ex(null, null, null, null) orelse error.SessionInitFailed;
 }
 
-pub fn handshake(session: *SESSION, fd: c_int) Error!void {
+pub fn handshake(session: *SESSION, fd: SocketArg) Error!void {
     if (libssh2_session_handshake(session, fd) != 0) return error.HandshakeFailed;
 }
 

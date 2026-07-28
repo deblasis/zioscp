@@ -10,6 +10,7 @@
 //! engine's `io` is otherwise orthogonal (local file ops, not network I/O).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const client = @import("sftp/client.zig");
 const libssh2 = @import("c_libssh2.zig");
 const engine = @import("engine.zig");
@@ -93,13 +94,19 @@ pub const Connection = struct {
 
         const stream = dial(io, host, port) catch return error.IoClosed;
         errdefer stream.close(io);
-        const fd: c_int = @intCast(stream.socket.handle);
+        // libssh2 takes the raw OS socket: an fd (c_int) on POSIX, a SOCKET
+        // (usize) on Windows where fd_t is a HANDLE. std.Io.net exposes it as
+        // the platform fd_t either way.
+        const sock: libssh2.SocketArg = if (builtin.os.tag == .windows)
+            @intFromPtr(stream.socket.handle)
+        else
+            @intCast(stream.socket.handle);
 
         const session = libssh2.newSession() catch return error.IoClosed;
         errdefer libssh2.disconnect(session);
         libssh2.sessionSetBlocking(session, 1);
 
-        libssh2.handshake(session, fd) catch return error.IoClosed;
+        libssh2.handshake(session, sock) catch return error.IoClosed;
 
         // Verify the server host key against the OpenSSH known_hosts file,
         // scp/BatchMode-faithful: strict refuses unknown and changed keys.

@@ -63,13 +63,15 @@ libssh2 provides only the SSH transport: zioscp opens a channel to the `sftp`
 subsystem and runs its existing SFTP codec over the channel bytes, so all the
 SFTP/resume/pipeline logic is shared between the two backends, including
 parallel transfers: both file-level (`-r -j N`) and single-file chunked (`-j N`)
-work on either backend. It cross-compiles too, e.g.
-`zig build -Dbackend=libssh2 -Dtarget=x86_64-linux-gnu` produces a self-contained
-Linux binary (the vendor script sets OpenSSL's target, passes `--host` so
-libssh2's autotools cross-build, and re-indexes the static archives to GNU
-format for zig's ELF reader). Licensing: OpenSSL is Apache-2.0 and libssh2 is
-BSD-3-Clause, both compatible with zioscp's dual MIT OR Apache-2.0; the upstream
-notices are copied into `vendor/<name>/` when built.
+work on either backend. It cross-compiles to a self-contained binary on all
+three targets -- `zig build -Dbackend=libssh2 -Dtarget=x86_64-linux-gnu` (Linux)
+or `... x86_64-windows-gnu` (Windows, via mingw) -- statically linking libssh2 +
+OpenSSL with no system ssh/libssh2/openssl dependency. The vendor script
+handles each target's quirks: OpenSSL's Configure target, libssh2's autotools
+`--host` (and an MSVC-guess libtool patch on mingw), and re-indexing the static
+archives to GNU format for zig's archive readers. Licensing: OpenSSL is
+Apache-2.0 and libssh2 is BSD-3-Clause, both compatible with zioscp's dual MIT
+OR Apache-2.0; the upstream notices are copied into `vendor/<name>/` when built.
 
 Both backends verify the server host key by default, like scp/ssh under
 BatchMode: an unknown or changed key is refused. `--host-key-check` mirrors
