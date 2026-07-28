@@ -146,3 +146,20 @@ pub const Connection = struct {
         self.gpa.destroy(self.dup);
     }
 };
+
+/// libssh2 connection opener for the parallel engine (mirrors engine.SshOpener):
+/// each parallel worker dials its own libssh2 connection directly (no subprocess).
+/// The parallel engine is generic over any opener whose `open` returns a type
+/// with `.sess` + `.deinit()`; this supplies the libssh2 one.
+pub const Opener = struct {
+    host: []const u8,
+    port: u16,
+    user: []const u8,
+    key: []const u8,
+    mode: engine.HostKeyCheck,
+    known_hosts: []const u8,
+
+    pub fn open(self: Opener, gpa: std.mem.Allocator, io: std.Io) Error!Connection {
+        return Connection.open(gpa, io, self.host, self.port, self.user, self.key, self.mode, self.known_hosts);
+    }
+};

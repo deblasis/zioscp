@@ -54,9 +54,9 @@ fetch (~a few minutes); later builds are fast.
 
 libssh2 provides only the SSH transport: zioscp opens a channel to the `sftp`
 subsystem and runs its existing SFTP codec over the channel bytes, so all the
-SFTP/resume/pipeline logic is shared between the two backends. Single-file and
-recursive (`-r`) transfers work; parallel (`-j`) is not yet wired through this
-backend (single connection). It cross-compiles too, e.g.
+SFTP/resume/pipeline logic is shared between the two backends, including
+parallel transfers: both file-level (`-r -j N`) and single-file chunked (`-j N`)
+work on either backend. It cross-compiles too, e.g.
 `zig build -Dbackend=libssh2 -Dtarget=x86_64-linux-gnu` produces a self-contained
 Linux binary (the vendor script sets OpenSSL's target, passes `--host` so
 libssh2's autotools cross-build, and re-indexes the static archives to GNU

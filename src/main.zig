@@ -204,37 +204,85 @@ pub fn main(init: std.process.Init) !void {
         .verbose = v.verbose,
     };
 
-    // The parallel paths (runParallel / *FileParallel) spawn their own ssh
-    // subprocesses; the libssh2 backend is single-connection for now.
-    if (v.jobs > 1 and config.backend == .libssh2)
-        bail("parallel transfers (-j) are not yet supported with the libssh2 backend", .{});
+    // Connection spec for the libssh2 backend (dials directly, no subprocess).
+    // Computed up front so the parallel paths below can build their opener; the
+    // whole block is comptime-eliminated under the ssh backend.
+    const Libssh2Spec = struct { host: []const u8, port: u16, user: []const u8, key: []const u8, kh: []const u8 };
+    const tl_spec: ?Libssh2Spec = if (config.backend == .libssh2) blk: {
+        const at = std.mem.indexOfScalar(u8, spec.user_host, '@') orelse
+            bail("libssh2 backend requires user@host", .{});
+        const port = std.fmt.parseInt(u16, v.port, 10) catch 22;
+        const key = v.identity orelse bail("libssh2 backend requires -i <key>", .{});
+        const home = init.environ_map.get("HOME") orelse
+            bail("libssh2 backend needs $HOME set for ~/.ssh/known_hosts", .{});
+        const kh = std.fmt.allocPrint(aa, "{s}/.ssh/known_hosts", .{home}) catch bail("oom", .{});
+        break :blk Libssh2Spec{
+            .host = spec.user_host[at + 1 ..],
+            .port = port,
+            .user = spec.user_host[0..at],
+            .key = key,
+            .kh = kh,
+        };
+    } else null;
 
     // Parallel directory transfer: collect the file list on one connection
-    // (also pre-creating dirs), then fan out across `jobs` connections.
+    // (also pre-creating dirs), then fan out across `jobs` connections. Each
+    // backend builds its own opener; the engine is opener-generic.
     if (v.recursive and v.jobs > 1) {
-        var coll = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
-            bail("connection failed: {s}", .{@errorName(err)});
         var list: std.ArrayList(engine.Task) = .empty;
-        if (download)
-            engine.collectDownloadTasks(aa, io, &coll.sess, spec.path, dest, &list) catch |err|
-                bail("collect failed: {s}", .{@errorName(err)})
-        else
-            engine.collectUploadTasks(aa, io, &coll.sess, src, spec.path, &list) catch |err|
-                bail("collect failed: {s}", .{@errorName(err)});
-        coll.deinit();
-        engine.runParallel(gpa, ssh_argv.items, list.items, opts, v.jobs) catch |err|
-            bail("parallel transfer failed: {s}", .{@errorName(err)});
+        if (config.backend == .libssh2) {
+            const tl = @import("transport_libssh2.zig");
+            const s = tl_spec.?;
+            var coll = tl.Connection.open(gpa, io, s.host, s.port, s.user, s.key, v.host_key_check, s.kh) catch |err|
+                bail("connection failed: {s}", .{@errorName(err)});
+            if (download)
+                engine.collectDownloadTasks(aa, io, &coll.sess, spec.path, dest, &list) catch |err|
+                    bail("collect failed: {s}", .{@errorName(err)})
+            else
+                engine.collectUploadTasks(aa, io, &coll.sess, src, spec.path, &list) catch |err|
+                    bail("collect failed: {s}", .{@errorName(err)});
+            coll.deinit();
+            const opener = tl.Opener{ .host = s.host, .port = s.port, .user = s.user, .key = s.key, .mode = v.host_key_check, .known_hosts = s.kh };
+            engine.runParallel(tl.Opener, gpa, opener, list.items, opts, v.jobs) catch |err|
+                bail("parallel transfer failed: {s}", .{@errorName(err)});
+        } else {
+            var coll = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
+                bail("connection failed: {s}", .{@errorName(err)});
+            if (download)
+                engine.collectDownloadTasks(aa, io, &coll.sess, spec.path, dest, &list) catch |err|
+                    bail("collect failed: {s}", .{@errorName(err)})
+            else
+                engine.collectUploadTasks(aa, io, &coll.sess, src, spec.path, &list) catch |err|
+                    bail("collect failed: {s}", .{@errorName(err)});
+            coll.deinit();
+            const opener = engine.SshOpener{ .ssh_argv = ssh_argv.items };
+            engine.runParallel(engine.SshOpener, gpa, opener, list.items, opts, v.jobs) catch |err|
+                bail("parallel transfer failed: {s}", .{@errorName(err)});
+        }
         return;
     }
 
     // Single-file chunked parallel: shard one file across `jobs` connections.
     if (!v.recursive and v.jobs > 1) {
-        if (download)
-            engine.downloadFileParallel(gpa, ssh_argv.items, spec.path, dest, opts, v.jobs) catch |err|
-                bail("download failed: {s}", .{@errorName(err)})
-        else
-            engine.uploadFileParallel(gpa, ssh_argv.items, src, spec.path, opts, v.jobs) catch |err|
-                bail("upload failed: {s}", .{@errorName(err)});
+        if (config.backend == .libssh2) {
+            const tl = @import("transport_libssh2.zig");
+            const s = tl_spec.?;
+            const opener = tl.Opener{ .host = s.host, .port = s.port, .user = s.user, .key = s.key, .mode = v.host_key_check, .known_hosts = s.kh };
+            if (download)
+                engine.downloadFileParallel(tl.Opener, gpa, opener, spec.path, dest, opts, v.jobs) catch |err|
+                    bail("download failed: {s}", .{@errorName(err)})
+            else
+                engine.uploadFileParallel(tl.Opener, gpa, opener, src, spec.path, opts, v.jobs) catch |err|
+                    bail("upload failed: {s}", .{@errorName(err)});
+        } else {
+            const opener = engine.SshOpener{ .ssh_argv = ssh_argv.items };
+            if (download)
+                engine.downloadFileParallel(engine.SshOpener, gpa, opener, spec.path, dest, opts, v.jobs) catch |err|
+                    bail("download failed: {s}", .{@errorName(err)})
+            else
+                engine.uploadFileParallel(engine.SshOpener, gpa, opener, src, spec.path, opts, v.jobs) catch |err|
+                    bail("upload failed: {s}", .{@errorName(err)});
+        }
         return;
     }
 

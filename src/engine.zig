@@ -541,23 +541,37 @@ pub fn downloadDir(
     }
 }
 
-const ParallelCtx = struct {
-    gpa: std.mem.Allocator,
+/// Opens a connection for a parallel worker. The parallel engine is generic
+/// over an opener: any type with `open(self, gpa, io) !Conn` where Conn has
+/// `.sess` (an sftp/client Session) and `.deinit()`. The ssh backend uses
+/// SshOpener (a subprocess per worker); the libssh2 backend supplies its own
+/// opener that dials directly (no ssh subprocess).
+pub const SshOpener = struct {
     ssh_argv: []const []const u8,
-    opts: Options,
-    tasks: []const Task,
-    next: std.atomic.Value(usize),
-    errors: std.atomic.Value(u32),
+    pub fn open(self: SshOpener, gpa: std.mem.Allocator, io: std.Io) !transport.Connection {
+        return transport.Connection.open(gpa, io, self.ssh_argv);
+    }
 };
 
-/// Worker thread body: its own Threaded io + ssh Connection, pulls tasks by
-/// atomic index until none remain. A per-file error is logged + counted, not
-/// fatal (the remaining tasks still run on other workers).
-fn parallelWorker(ctx: *ParallelCtx) void {
+fn ParallelCtx(comptime Opener: type) type {
+    return struct {
+        gpa: std.mem.Allocator,
+        opts: Options,
+        tasks: []const Task,
+        opener: Opener,
+        next: std.atomic.Value(usize),
+        errors: std.atomic.Value(u32),
+    };
+}
+
+/// Worker thread body: its own Threaded io + connection, pulls tasks by atomic
+/// index until none remain. A per-file error is logged + counted, not fatal (the
+/// remaining tasks still run on other workers).
+fn parallelWorker(comptime Opener: type, ctx: *ParallelCtx(Opener)) void {
     var threaded = std.Io.Threaded.init(ctx.gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var conn = transport.Connection.open(ctx.gpa, io, ctx.ssh_argv) catch return;
+    var conn = ctx.opener.open(ctx.gpa, io) catch return;
     defer conn.deinit();
     while (true) {
         const idx = ctx.next.fetchAdd(1, .monotonic);
@@ -577,12 +591,13 @@ fn parallelWorker(ctx: *ParallelCtx) void {
 }
 
 /// Run a batch of file tasks across `jobs` worker threads, each with its own
-/// ssh subprocess + session (so up to `jobs` files transfer concurrently).
-/// Tasks are distributed lock-free via an atomic index. Progress bars are
-/// disabled (K interleaving bars would be garbage); parallel mode is quiet.
+/// connection + session (so up to `jobs` files transfer concurrently). Tasks are
+/// distributed lock-free via an atomic index. Progress bars are disabled (K
+/// interleaving bars would be garbage); parallel mode is quiet.
 pub fn runParallel(
+    comptime Opener: type,
     gpa: std.mem.Allocator,
-    ssh_argv: []const []const u8,
+    opener: Opener,
     tasks: []const Task,
     opts: Options,
     jobs: u32,
@@ -590,11 +605,11 @@ pub fn runParallel(
     if (tasks.len == 0) return;
     var quiet_opts = opts;
     quiet_opts.progress = false;
-    var ctx: ParallelCtx = .{
+    var ctx: ParallelCtx(Opener) = .{
         .gpa = gpa,
-        .ssh_argv = ssh_argv,
         .opts = quiet_opts,
         .tasks = tasks,
+        .opener = opener,
         .next = std.atomic.Value(usize).init(0),
         .errors = std.atomic.Value(u32).init(0),
     };
@@ -602,7 +617,7 @@ pub fn runParallel(
     const threads = try gpa.alloc(std.Thread, j);
     defer gpa.free(threads);
     for (0..j) |i| {
-        threads[i] = std.Thread.spawn(.{}, parallelWorker, .{&ctx}) catch |err| {
+        threads[i] = std.Thread.spawn(.{}, parallelWorker, .{ Opener, &ctx }) catch |err| {
             for (threads[0..i]) |t| t.join();
             return err;
         };
@@ -633,28 +648,30 @@ pub fn runParallel(
 // files (<=1 chunk) fall back to the single-stream path (which has its own
 // offset + MAC resume).
 
-const ChunkCtx = struct {
-    gpa: std.mem.Allocator,
-    ssh_argv: []const []const u8,
-    opts: Options,
-    local_path: []const u8,
-    remote_path: []const u8,
-    bitmap_path: []const u8,
-    /// Loaded completion bitmap for this transfer (read-only during the run);
-    /// empty on a fresh start. Includes the 12-byte header.
-    done: []const u8,
-    total: u64,
-    chunk: u32,
-    count: u64,
-    next: std.atomic.Value(usize),
-    errors: std.atomic.Value(u32),
-};
+fn ChunkCtx(comptime Opener: type) type {
+    return struct {
+        gpa: std.mem.Allocator,
+        opts: Options,
+        local_path: []const u8,
+        remote_path: []const u8,
+        bitmap_path: []const u8,
+        opener: Opener,
+        /// Loaded completion bitmap for this transfer (read-only during the run);
+        /// empty on a fresh start. Includes the 12-byte header.
+        done: []const u8,
+        total: u64,
+        chunk: u32,
+        count: u64,
+        next: std.atomic.Value(usize),
+        errors: std.atomic.Value(u32),
+    };
+}
 
-fn uploadChunkWorker(ctx: *ChunkCtx) void {
+fn uploadChunkWorker(comptime Opener: type, ctx: *ChunkCtx(Opener)) void {
     var threaded = std.Io.Threaded.init(ctx.gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var conn = transport.Connection.open(ctx.gpa, io, ctx.ssh_argv) catch return;
+    var conn = ctx.opener.open(ctx.gpa, io) catch return;
     defer conn.deinit();
     const handle = conn.sess.open(ctx.remote_path, packets.FXF_WRITE | packets.FXF_CREATE, packets.Attrs.empty) catch return;
     defer {
@@ -706,11 +723,11 @@ fn uploadChunkWorker(ctx: *ChunkCtx) void {
     }
 }
 
-fn downloadChunkWorker(ctx: *ChunkCtx) void {
+fn downloadChunkWorker(comptime Opener: type, ctx: *ChunkCtx(Opener)) void {
     var threaded = std.Io.Threaded.init(ctx.gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var conn = transport.Connection.open(ctx.gpa, io, ctx.ssh_argv) catch return;
+    var conn = ctx.opener.open(ctx.gpa, io) catch return;
     defer conn.deinit();
     const rh = conn.sess.open(ctx.remote_path, packets.FXF_READ, packets.Attrs.empty) catch return;
     defer {
@@ -765,12 +782,13 @@ fn downloadChunkWorker(ctx: *ChunkCtx) void {
     }
 }
 
-/// Upload a single file in parallel across `jobs` ssh connections, sharding it
-/// at offset ranges. Falls back to single-stream for files that fit in one
-/// chunk. See the P3 note above on the concurrent-write protocol.
+/// Upload a single file in parallel across `jobs` connections, sharding it at
+/// offset ranges. Falls back to single-stream for files that fit in one chunk.
+/// See the P3 note above on the concurrent-write protocol.
 pub fn uploadFileParallel(
+    comptime Opener: type,
     gpa: std.mem.Allocator,
-    ssh_argv: []const []const u8,
+    opener: Opener,
     local_path: []const u8,
     remote_path: []const u8,
     opts: Options,
@@ -784,7 +802,7 @@ pub fn uploadFileParallel(
     const chunk = effectiveChunk(opts);
     const count = chunker.chunkCount(total, chunk);
     if (count <= 1) {
-        var conn = try transport.Connection.open(gpa, io0, ssh_argv);
+        var conn = try opener.open(gpa, io0);
         defer conn.deinit();
         try uploadFile(gpa, io0, &conn.sess, local_path, remote_path, opts);
         return;
@@ -807,7 +825,7 @@ pub fn uploadFileParallel(
     // partial remote and its bitmap (already loaded).
     if (!is_resume) {
         {
-            var c = try transport.Connection.open(gpa, io0, ssh_argv);
+            var c = try opener.open(gpa, io0);
             defer c.deinit();
             const h = try c.sess.open(remote_path, packets.FXF_WRITE | packets.FXF_CREATE | packets.FXF_TRUNC, packets.Attrs.empty);
             defer {
@@ -818,13 +836,13 @@ pub fn uploadFileParallel(
         try resume_mod.initChunkBitmap(io0, bitmap_path, total, chunk);
     }
 
-    var ctx: ChunkCtx = .{
+    var ctx: ChunkCtx(Opener) = .{
         .gpa = gpa,
-        .ssh_argv = ssh_argv,
         .opts = opts,
         .local_path = local_path,
         .remote_path = remote_path,
         .bitmap_path = bitmap_path,
+        .opener = opener,
         .done = done,
         .total = total,
         .chunk = chunk,
@@ -832,15 +850,16 @@ pub fn uploadFileParallel(
         .next = std.atomic.Value(usize).init(0),
         .errors = std.atomic.Value(u32).init(0),
     };
-    try spawnChunkWorkers(gpa, uploadChunkWorker, &ctx, jobs, count);
+    try spawnChunkWorkers(Opener, uploadChunkWorker, &ctx, jobs, count);
     if (ctx.errors.load(.monotonic) != 0) return error.Failure;
     resume_mod.removeFile(io0, bitmap_path);
 }
 
-/// Download a single file in parallel across `jobs` ssh connections.
+/// Download a single file in parallel across `jobs` connections.
 pub fn downloadFileParallel(
+    comptime Opener: type,
     gpa: std.mem.Allocator,
-    ssh_argv: []const []const u8,
+    opener: Opener,
     remote_path: []const u8,
     local_path: []const u8,
     opts: Options,
@@ -849,14 +868,14 @@ pub fn downloadFileParallel(
     var t0 = std.Io.Threaded.init(gpa, .{});
     defer t0.deinit();
     const io0 = t0.io();
-    var probe = try transport.Connection.open(gpa, io0, ssh_argv);
+    var probe = try opener.open(gpa, io0);
     const total: u64 = (try probe.sess.stat(remote_path)).size;
     probe.deinit();
 
     const chunk = effectiveChunk(opts);
     const count = chunker.chunkCount(total, chunk);
     if (count <= 1) {
-        var conn = try transport.Connection.open(gpa, io0, ssh_argv);
+        var conn = try opener.open(gpa, io0);
         defer conn.deinit();
         try downloadFile(gpa, io0, &conn.sess, remote_path, local_path, opts);
         return;
@@ -883,13 +902,13 @@ pub fn downloadFileParallel(
         try resume_mod.initChunkBitmap(io0, bitmap_path, total, chunk);
     }
 
-    var ctx: ChunkCtx = .{
+    var ctx: ChunkCtx(Opener) = .{
         .gpa = gpa,
-        .ssh_argv = ssh_argv,
         .opts = opts,
         .local_path = local_path,
         .remote_path = remote_path,
         .bitmap_path = bitmap_path,
+        .opener = opener,
         .done = done,
         .total = total,
         .chunk = chunk,
@@ -897,23 +916,23 @@ pub fn downloadFileParallel(
         .next = std.atomic.Value(usize).init(0),
         .errors = std.atomic.Value(u32).init(0),
     };
-    try spawnChunkWorkers(gpa, downloadChunkWorker, &ctx, jobs, count);
+    try spawnChunkWorkers(Opener, downloadChunkWorker, &ctx, jobs, count);
     if (ctx.errors.load(.monotonic) != 0) return error.Failure;
     resume_mod.removeFile(io0, bitmap_path);
 }
 
 fn spawnChunkWorkers(
-    gpa: std.mem.Allocator,
+    comptime Opener: type,
     comptime worker: anytype,
-    ctx: *ChunkCtx,
+    ctx: *ChunkCtx(Opener),
     jobs: u32,
     count: u64,
 ) !void {
     const j: usize = @min(@as(usize, @intCast(jobs)), @as(usize, @intCast(count)));
-    const threads = try gpa.alloc(std.Thread, j);
-    defer gpa.free(threads);
+    const threads = try ctx.gpa.alloc(std.Thread, j);
+    defer ctx.gpa.free(threads);
     for (0..j) |i| {
-        threads[i] = std.Thread.spawn(.{}, worker, .{ctx}) catch |err| {
+        threads[i] = std.Thread.spawn(.{}, worker, .{ Opener, ctx }) catch |err| {
             for (threads[0..i]) |t| t.join();
             return err;
         };

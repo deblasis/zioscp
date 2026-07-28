@@ -251,7 +251,7 @@ test "integration: parallel (-j) upload then download round-trips a tree" {
     try engine.collectUploadTasks(testing.allocator, io, &coll.sess, src, remote, &up);
     coll.deinit();
     try testing.expectEqual(@as(usize, 2), up.items.len);
-    try engine.runParallel(testing.allocator, &argv, up.items, .{ .chunk_size = 8192 }, 4);
+    try engine.runParallel(engine.SshOpener, testing.allocator, engine.SshOpener{ .ssh_argv = &argv }, up.items, .{ .chunk_size = 8192 }, 4);
 
     // Collect + parallel download.
     var coll2 = connect(io, testing.allocator) orelse return error.SkipZigTest;
@@ -259,7 +259,7 @@ test "integration: parallel (-j) upload then download round-trips a tree" {
     defer engine.freeTasks(testing.allocator, &dn);
     try engine.collectDownloadTasks(testing.allocator, io, &coll2.sess, remote, dst, &dn);
     coll2.deinit();
-    try engine.runParallel(testing.allocator, &argv, dn.items, .{ .chunk_size = 8192 }, 4);
+    try engine.runParallel(engine.SshOpener, testing.allocator, engine.SshOpener{ .ssh_argv = &argv }, dn.items, .{ .chunk_size = 8192 }, 4);
 
     const ga = cwd.readFileAlloc(io, "zioscp_par_dst/a.bin", testing.allocator, .limited(1 << 20)) catch return error.UnexpectedTestFailure;
     defer testing.allocator.free(ga);
@@ -289,8 +289,8 @@ test "integration: P3 single-file chunked parallel is byte-identical" {
     try cwd.writeFile(io, .{ .sub_path = local, .data = payload });
 
     const argv = sshArgv();
-    try engine.uploadFileParallel(testing.allocator, &argv, local, remote, .{ .chunk_size = 8192 }, 4);
-    try engine.downloadFileParallel(testing.allocator, &argv, remote, pulled, .{ .chunk_size = 8192 }, 4);
+    try engine.uploadFileParallel(engine.SshOpener, testing.allocator, engine.SshOpener{ .ssh_argv = &argv }, local, remote, .{ .chunk_size = 8192 }, 4);
+    try engine.downloadFileParallel(engine.SshOpener, testing.allocator, engine.SshOpener{ .ssh_argv = &argv }, remote, pulled, .{ .chunk_size = 8192 }, 4);
 
     const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
     defer testing.allocator.free(got);
@@ -687,8 +687,9 @@ test "battle: parallel worker failure skips one file but completes the rest" {
 
     const argv = sshArgv();
     try testing.expectError(error.Failure, engine.runParallel(
+        engine.SshOpener,
         testing.allocator,
-        &argv,
+        engine.SshOpener{ .ssh_argv = &argv },
         list.items,
         .{ .chunk_size = 8192 },
         3,
@@ -846,7 +847,7 @@ test "battle: P3 upload resume skips done chunks and fills the rest" {
     try resume_mod.markChunkDone(io, bitmap, 0);
 
     const argv = sshArgv();
-    try engine.uploadFileParallel(testing.allocator, &argv, local, remote, .{ .chunk_size = chunk, .resume_enabled = true }, 4);
+    try engine.uploadFileParallel(engine.SshOpener, testing.allocator, engine.SshOpener{ .ssh_argv = &argv }, local, remote, .{ .chunk_size = chunk, .resume_enabled = true }, 4);
 
     try engine.downloadFile(testing.allocator, io, &conn.sess, remote, pulled, .{ .chunk_size = chunk });
     const got = cwd.readFileAlloc(io, pulled, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
@@ -896,7 +897,7 @@ test "battle: P3 download resume skips done chunks and fills the rest" {
     try resume_mod.markChunkDone(io, bitmap, 0);
 
     const argv = sshArgv();
-    try engine.downloadFileParallel(testing.allocator, &argv, remote, local, .{ .chunk_size = chunk, .resume_enabled = true }, 4);
+    try engine.downloadFileParallel(engine.SshOpener, testing.allocator, engine.SshOpener{ .ssh_argv = &argv }, remote, local, .{ .chunk_size = chunk, .resume_enabled = true }, 4);
 
     const got = cwd.readFileAlloc(io, local, testing.allocator, .limited(1 << 26)) catch return error.UnexpectedTestFailure;
     defer testing.allocator.free(got);
