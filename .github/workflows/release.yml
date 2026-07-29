@@ -58,7 +58,9 @@ jobs:
           cp LICENSE-MIT LICENSE-APACHE "$stage/"
           asset="zioscp-${version}-${{ matrix.target }}.${{ matrix.archive }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            ( cd "$stage" && zip -r "$PWD/$asset" . )
+            # -j stores filenames only (no dir prefix); written to the workspace
+            # cwd (a relative $asset), so upload-artifact finds it.
+            zip -j "$asset" "$stage"/*
           else
             tar -C "$stage" -czf "$asset" .
           fi
