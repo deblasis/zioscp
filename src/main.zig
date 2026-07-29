@@ -219,6 +219,15 @@ pub fn main(init: std.process.Init) !void {
     const shk_opt = std.fmt.allocPrint(aa, "StrictHostKeyChecking={s}", .{shk_val}) catch bail("oom", .{});
     ssh_argv.append(aa, "-o") catch bail("oom", .{});
     ssh_argv.append(aa, shk_opt) catch bail("oom", .{});
+    // Bound the connection so an unreachable/stalled server fails fast instead
+    // of hanging on the OS TCP default (~75s) or an indefinite wait. Mirrors the
+    // libssh2 backend's SESSION_TIMEOUT_MS (transport_libssh2.zig).
+    ssh_argv.append(aa, "-o") catch bail("oom", .{});
+    ssh_argv.append(aa, "ConnectTimeout=30") catch bail("oom", .{});
+    ssh_argv.append(aa, "-o") catch bail("oom", .{});
+    ssh_argv.append(aa, "ServerAliveInterval=15") catch bail("oom", .{});
+    ssh_argv.append(aa, "-o") catch bail("oom", .{});
+    ssh_argv.append(aa, "ServerAliveCountMax=2") catch bail("oom", .{});
     ssh_argv.append(aa, "-s") catch bail("oom", .{});
     ssh_argv.append(aa, "--") catch bail("oom", .{});
     ssh_argv.append(aa, spec.user_host) catch bail("oom", .{});

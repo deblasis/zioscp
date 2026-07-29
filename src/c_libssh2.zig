@@ -31,6 +31,7 @@ extern "c" fn libssh2_session_init_ex(
     abstract: ?*anyopaque,
 ) ?*SESSION;
 extern "c" fn libssh2_session_set_blocking(session: *SESSION, blocking: c_int) void;
+extern "c" fn libssh2_session_set_timeout(session: *SESSION, timeout: c_long) void;
 extern "c" fn libssh2_session_handshake(session: *SESSION, socket: SocketArg) c_int;
 extern "c" fn libssh2_userauth_publickey_fromfile_ex(
     session: *SESSION,
@@ -173,6 +174,13 @@ pub fn handshake(session: *SESSION, fd: SocketArg) Error!void {
 
 pub fn sessionSetBlocking(session: *SESSION, blocking: c_int) void {
     libssh2_session_set_blocking(session, blocking);
+}
+
+/// Per blocking-call timeout (ms). A blocking libssh2 call (handshake/auth/
+/// channel/data) that does not complete within this returns an error, so a
+/// stalled or unreachable server fails fast instead of hanging forever.
+pub fn sessionSetTimeout(session: *SESSION, ms: c_long) void {
+    libssh2_session_set_timeout(session, ms);
 }
 
 pub fn authKey(session: *SESSION, user: [:0]const u8, pub_key: [:0]const u8, priv_key: [:0]const u8) Error!void {

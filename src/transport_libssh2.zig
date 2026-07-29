@@ -17,6 +17,10 @@ const engine = @import("engine.zig");
 
 const Error = client.Error;
 
+// Per-call cap on blocking libssh2 waits (handshake/hostkey/auth/channel/data).
+// Keep in sync with the ssh-subprocess backend's ConnectTimeout in main.zig.
+const SESSION_TIMEOUT_MS: c_long = 30_000;
+
 fn mapLe(err: libssh2.Error) Error {
     return switch (err) {
         error.AuthFailed => error.PermissionDenied,
@@ -211,6 +215,11 @@ pub const Connection = struct {
         const session = libssh2.newSession() catch return error.IoClosed;
         errdefer libssh2.disconnect(session);
         libssh2.sessionSetBlocking(session, 1);
+        // Bound blocking libssh2 calls so a stalled/unreachable server fails
+        // fast instead of hanging on an infinite poll inside _libssh2_wait_socket
+        // (api_timeout==0 = wait forever). Per-call: a steady (even slow)
+        // transfer keeps making progress under the deadline.
+        libssh2.sessionSetTimeout(session, SESSION_TIMEOUT_MS);
 
         libssh2.handshake(session, sock) catch return error.IoClosed;
 
