@@ -41,6 +41,10 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Locate macOS SDK (Security/CoreFoundation frameworks)
+        if: runner.os == 'macOS'
+        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
       - name: Build (self-contained libssh2 backend, ReleaseFast)
         run: zig build -Dbackend=libssh2 -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
