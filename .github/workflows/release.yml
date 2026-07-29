@@ -20,8 +20,10 @@ jobs:
       matrix:
         include:
           # macOS binaries need the native SDK (Security/CoreFoundation frameworks).
-          - { runner: macos-latest, target: aarch64-macos,   archive: tar.gz }
-          - { runner: macos-latest, target: x86_64-macos,    archive: tar.gz }
+          # Pin to macos-14 (Xcode 15 / SDK 15) — zig 0.16 can't resolve frameworks
+          # in the MacOSX26 SDK shipped on macos-latest.
+          - { runner: macos-14, target: aarch64-macos,   archive: tar.gz }
+          - { runner: macos-14, target: x86_64-macos,    archive: tar.gz }
           # Linux + Windows cross-compile cleanly from Linux via zig cc.
           - { runner: ubuntu-latest, target: x86_64-linux-gnu,  archive: tar.gz }
           - { runner: ubuntu-latest, target: aarch64-linux-gnu, archive: tar.gz }
