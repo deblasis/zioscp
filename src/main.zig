@@ -5,6 +5,7 @@
 //! from a typed struct via zioarg, which also generates --help.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const transport = @import("transport.zig");
 const engine = @import("engine.zig");
 const packets = @import("sftp/packets.zig");
@@ -49,8 +50,25 @@ fn remoteSpec(s: []const u8) ?RemoteSpec {
     const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
     const lhs = s[0..colon];
     if (lhs.len == 0) return null;
+    // A Windows drive-letter path (C:\... or C:/...) is a local path, not a
+    // host spec. Gated to the Windows build so mac/linux host parsing is
+    // unchanged (a single-letter host before a colon is vanishingly rare there).
+    if (builtin.os.tag == .windows and lhs.len == 1 and std.ascii.isAlphabetic(lhs[0])) {
+        const after = s[colon + 1];
+        if (after == '\\' or after == '/') return null;
+    }
     if (std.mem.indexOfScalar(u8, lhs, '/') != null) return null;
     return .{ .user_host = lhs, .path = s[colon + 1 ..] };
+}
+
+/// Home directory for the SSH known_hosts lookup: $HOME on unix, falling back to
+/// $USERPROFILE on Windows (where HOME is not set by default).
+fn homeDir(environ_map: anytype) ?[]const u8 {
+    if (environ_map.get("HOME")) |h| return h;
+    if (builtin.os.tag == .windows) {
+        if (environ_map.get("USERPROFILE")) |u| return u;
+    }
+    return null;
 }
 
 fn bail(comptime fmt: []const u8, args: anytype) noreturn {
@@ -223,8 +241,8 @@ pub fn main(init: std.process.Init) !void {
             bail("libssh2 backend requires user@host", .{});
         const port = std.fmt.parseInt(u16, v.port, 10) catch 22;
         const key = v.identity orelse bail("libssh2 backend requires -i <key>", .{});
-        const home = init.environ_map.get("HOME") orelse
-            bail("libssh2 backend needs $HOME set for ~/.ssh/known_hosts", .{});
+        const home = homeDir(init.environ_map) orelse
+            bail("libssh2 backend needs HOME (or USERPROFILE on Windows) for ~/.ssh/known_hosts", .{});
         const kh = std.fmt.allocPrint(aa, "{s}/.ssh/known_hosts", .{home}) catch bail("oom", .{});
         break :blk Libssh2Spec{
             .host = spec.user_host[at + 1 ..],
@@ -297,8 +315,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (config.backend == .libssh2) {
-        const home = init.environ_map.get("HOME") orelse
-            bail("libssh2 backend needs $HOME set for ~/.ssh/known_hosts", .{});
+        const home = homeDir(init.environ_map) orelse
+            bail("libssh2 backend needs HOME (or USERPROFILE on Windows) for ~/.ssh/known_hosts", .{});
         const kh_path = std.fmt.allocPrint(aa, "{s}/.ssh/known_hosts", .{home}) catch bail("oom", .{});
         transferLibssh2(gpa, io, opts, download, v.recursive, src, dest, spec.path, spec.user_host, v.port, v.identity, v.host_key_check, kh_path) catch |err|
             bail("transfer failed: {s}", .{@errorName(err)});
