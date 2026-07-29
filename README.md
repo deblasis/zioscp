@@ -127,6 +127,14 @@ display — the scrolling per-file log + pinned status bar). The
 (stderr drain, no deadlocks, child reap on every path). See the internal repo
 for the design doc.
 
+## Sponsor
+
+If zioscp saves you time, consider backing its development:
+
+- GitHub Sponsors: https://github.com/sponsors/deblasis
+- Ko-fi: https://ko-fi.com/deblasis
+- ETH: `deblasis.eth`
+
 ## License
 
 Dual-licensed under either of
