@@ -19,15 +19,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS binaries need the native SDK (Security/CoreFoundation frameworks).
-          # Pin to macos-14 (Xcode 15 / SDK 15) — zig 0.16 can't resolve frameworks
-          # in the MacOSX26 SDK shipped on macos-latest.
-          - { runner: macos-14, target: aarch64-macos,   archive: tar.gz }
-          - { runner: macos-14, target: x86_64-macos,    archive: tar.gz }
-          # Linux + Windows cross-compile cleanly from Linux via zig cc.
-          - { runner: ubuntu-latest, target: x86_64-linux-gnu,  archive: tar.gz }
-          - { runner: ubuntu-latest, target: aarch64-linux-gnu, archive: tar.gz }
-          - { runner: ubuntu-latest, target: x86_64-windows-gnu, archive: zip }
+          # macOS uses the ssh backend (drives the system ssh that macOS ships);
+          # the self-contained libssh2 backend can't link on zig 0.16 + the
+          # current macOS SDK (framework resolution returns empty), so mac ships
+          # the ssh-backend binary for now. Linux + Windows are self-contained
+          # libssh2 builds, cross-compiled from Linux.
+          - { runner: macos-latest,  target: aarch64-macos,     archive: tar.gz, backend: "" }
+          - { runner: macos-latest,  target: x86_64-macos,      archive: tar.gz, backend: "" }
+          - { runner: ubuntu-latest, target: x86_64-linux-gnu,  archive: tar.gz, backend: "-Dbackend=libssh2" }
+          - { runner: ubuntu-latest, target: aarch64-linux-gnu, archive: tar.gz, backend: "-Dbackend=libssh2" }
+          - { runner: ubuntu-latest, target: x86_64-windows-gnu, archive: zip,   backend: "-Dbackend=libssh2" }
     steps:
       - uses: actions/checkout@v4
 
@@ -35,20 +36,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq autoconf automake libtool perl make curl
 
-      - name: Install vendor build deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install autoconf automake libtool
-
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.16.0
 
-      - name: Locate macOS SDK (Security/CoreFoundation frameworks)
-        if: runner.os == 'macOS'
-        run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
-
-      - name: Build (self-contained libssh2 backend, ReleaseFast)
-        run: zig build -Dbackend=libssh2 -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+      - name: Build
+        run: zig build ${{ matrix.backend }} -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
       - name: Package
         run: |
