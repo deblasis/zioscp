@@ -127,6 +127,26 @@ display — the scrolling per-file log + pinned status bar). The
 (stderr drain, no deadlocks, child reap on every path). See the internal repo
 for the design doc.
 
+## Trust and antivirus on Windows
+
+zioscp's Windows binary is self-contained (static libssh2 + OpenSSL) and does
+raw networking, SSH/crypto, and bulk file I/O. Because it is also **unsigned**
+(Authenticode code-signing certificates are not free), some antivirus products
+flag it on first download as a false positive. It is not malware: every binary
+is built from public source by GitHub Actions, and each release ships a
+`SHA256SUMS.txt` you can verify against.
+
+**The plan:** once zioscp has enough traction or sponsorship to justify it,
+releases will be Authenticode-signed (a personal code-signing certificate),
+which removes the AV and SmartScreen warnings for the vast majority of users.
+
+**How you can help:**
+
+- Sponsor the project at https://github.com/sponsors/deblasis (this is what
+  would fund signing).
+- If you trust the source, add an antivirus exclusion for zioscp.
+- Report the file as a false positive to your antivirus vendor.
+
 ## Sponsor
 
 If zioscp saves you time, consider backing its development:
