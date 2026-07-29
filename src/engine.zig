@@ -31,6 +31,11 @@ pub const Options = struct {
     verbose: bool = false,
     /// Apply source permissions/mtime to the destination. Permission bits only.
     preserve: bool = false,
+    /// Optional shared byte counter for aggregate (parallel) progress. When set,
+    /// Progress.step bumps it by the bytes transferred even when the per-file bar
+    /// is suppressed (parallel mode), so one aggregate line can track total
+    /// throughput across all workers. Null for single-stream runs.
+    shared_done: ?*std.atomic.Value(u64) = null,
 };
 
 /// Server host-key verification policy (mirrors ssh's StrictHostKeyChecking):
@@ -123,6 +128,7 @@ const Progress = struct {
     last_render_ns: i96,
     start_ns: i96,
     show: bool,
+    shared: ?*std.atomic.Value(u64) = null,
     label_buf: [28]u8 = undefined,
     label_len: u8 = 0,
 
@@ -143,6 +149,7 @@ const Progress = struct {
             .last_render_ns = now,
             .start_ns = now,
             .show = opts.progress and stderrIsTty(io),
+            .shared = opts.shared_done,
         };
         p.bar.current = resume_off;
         // Keep the tail of long paths (filenames matter more than the prefix).
@@ -154,6 +161,9 @@ const Progress = struct {
     }
 
     fn step(self: *Progress, inc: u64) void {
+        // Always feed the shared aggregate counter (parallel mode) even when the
+        // per-file bar is suppressed; the renderer thread reads it.
+        if (self.shared) |s| _ = s.fetchAdd(inc, .monotonic);
         if (!self.show) return;
         self.bar.advance(inc);
         const pct = self.bar.percent();
@@ -207,6 +217,78 @@ const Progress = struct {
         std.debug.print("\n", .{});
     }
 };
+
+/// Shared aggregate progress for parallel (`-r -j`) transfers. Workers bump
+/// `bytes_done` (via Options.shared_done -> Progress.step) as chunks land and
+/// `files_done` per completed task; a dedicated renderer thread draws ONE moving
+/// line (files X/Y, bar, bytes, throughput, ETA) so the user sees the whole run
+/// instead of silence. TTY-gated at the call site; non-interactive runs skip the
+/// renderer entirely. All state is atomic (lock-free); the renderer only reads.
+const ParallelProgress = struct {
+    bytes_done: std.atomic.Value(u64),
+    files_done: std.atomic.Value(u32),
+    total_bytes: u64,
+    files_total: u32,
+    start_ns: i96,
+    stop: std.atomic.Value(bool),
+
+    const AGGR_LINE =
+        zioansi.Color.cyan.fg() ++ "files {d}/{d}  {s}" ++ zioansi.reset ++ "  " ++
+        zioansi.Style.dim.enable() ++ "{s}/{s}  {s}/s  eta {s}" ++ zioansi.reset;
+
+    fn init(total_bytes: u64, files_total: u32, start_ns: i96) ParallelProgress {
+        return .{
+            .bytes_done = std.atomic.Value(u64).init(0),
+            .files_done = std.atomic.Value(u32).init(0),
+            .total_bytes = total_bytes,
+            .files_total = files_total,
+            .start_ns = start_ns,
+            .stop = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    /// Build the aggregate line into `out` (pure; testable without threads).
+    fn line(self: *ParallelProgress, now_ns: i96, bar: *zioprogress.ProgressBar, out: []u8) []const u8 {
+        const done_b = self.bytes_done.load(.monotonic);
+        const done_f = self.files_done.load(.monotonic);
+        const elapsed_s: f64 = @as(f64, @floatFromInt(now_ns - self.start_ns)) / 1_000_000_000.0;
+        const rate: f64 = if (elapsed_s > 0.0) @as(f64, @floatFromInt(done_b)) / elapsed_s else 0.0;
+        const remaining: u64 = if (self.total_bytes > done_b) self.total_bytes - done_b else 0;
+        const eta_s: f64 = if (rate > 0.0) @as(f64, @floatFromInt(remaining)) / rate else 0.0;
+        bar.current = if (done_b <= self.total_bytes) done_b else self.total_bytes;
+
+        var bar_buf: [48]u8 = undefined;
+        var d_buf: [16]u8 = undefined;
+        var t_buf: [16]u8 = undefined;
+        var r_buf: [16]u8 = undefined;
+        var e_buf: [12]u8 = undefined;
+        return std.fmt.bufPrint(out, AGGR_LINE, .{
+            done_f,
+            self.files_total,
+            bar.render(&bar_buf),
+            humanCount(&d_buf, done_b),
+            humanCount(&t_buf, self.total_bytes),
+            humanCount(&r_buf, @intFromFloat(@max(rate, 0.0))),
+            fmtEta(&e_buf, eta_s),
+        }) catch "";
+    }
+};
+
+/// Renderer thread body: ticks ~10/s, drawing the aggregate line until `stop` is
+/// set, then one final render at completion. Uses the caller's io (clock reads
+/// and a short sleep are thread-safe and the main thread is blocked in join).
+fn progressRenderer(pp: *ParallelProgress, io: std.Io) void {
+    var bar = zioprogress.ProgressBar.init(.{ .width = 20 }, if (pp.total_bytes == 0) 1 else pp.total_bytes);
+    var buf: [256]u8 = undefined;
+    while (!pp.stop.load(.monotonic)) {
+        std.Io.sleep(io, .{ .nanoseconds = 100_000_000 }, .awake) catch {};
+        const s = pp.line(std.Io.Clock.now(.awake, io).nanoseconds, &bar, &buf);
+        if (s.len > 0) std.debug.print("\r{s} \x1b[K", .{s});
+    }
+    // Final render reflects the completed totals.
+    const s = pp.line(std.Io.Clock.now(.awake, io).nanoseconds, &bar, &buf);
+    if (s.len > 0) std.debug.print("\r{s} \x1b[K", .{s});
+}
 
 /// Adaptive sliding-window controller for the SFTP pipeline. Sizes the in-flight
 /// window to the bandwidth-delay product without timing per-request RTT: it
@@ -310,6 +392,20 @@ test "humanCount and fmtEta format cleanly" {
     try std.testing.expectEqualStrings("--:--", fmtEta(&e, 0));
     try std.testing.expectEqualStrings("1:30", fmtEta(&e, 90));
     try std.testing.expectEqualStrings("1:02:03", fmtEta(&e, 3723));
+}
+
+test "ParallelProgress aggregate line renders files, bytes, rate, eta" {
+    var pp = ParallelProgress.init(1_000_000_000, 10, 0);
+    pp.bytes_done.store(400_000_000, .monotonic);
+    pp.files_done.store(4, .monotonic);
+    var bar = zioprogress.ProgressBar.init(.{ .width = 20 }, 1_000_000_000);
+    var buf: [256]u8 = undefined;
+    // start_ns=0, now=10s -> 40 MiB/s, 15s remaining.
+    const s = pp.line(10_000_000_000, &bar, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, s, "files 4/10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "MiB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "/s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "eta") != null);
 }
 
 /// SFTP v3 guarantees servers can process packets with at least ~34000 bytes
@@ -598,6 +694,8 @@ pub const Task = struct {
     direction: resume_mod.Direction,
     local: []const u8,
     remote: []const u8,
+    /// File size in bytes (for aggregate parallel progress + ETA). 0 if unknown.
+    size: u64 = 0,
 };
 
 pub fn freeTasks(gpa: std.mem.Allocator, list: *std.ArrayList(Task)) void {
@@ -637,7 +735,12 @@ pub fn collectUploadTasks(
                 const cr = try std.fs.path.join(gpa, &.{ remote_dir, entry.name });
                 errdefer gpa.free(cl);
                 errdefer gpa.free(cr);
-                try out.append(gpa, .{ .direction = .upload, .local = cl, .remote = cr });
+                // Size for aggregate progress; tolerate stat failure (treat as 0).
+                const sz: u64 = sz: {
+                    const st = dir.statFile(io, entry.name, .{}) catch break :sz 0;
+                    break :sz st.size;
+                };
+                try out.append(gpa, .{ .direction = .upload, .local = cl, .remote = cr, .size = sz });
             },
             .directory => {
                 const cl = try std.fs.path.join(gpa, &.{ local_dir, entry.name });
@@ -689,7 +792,8 @@ pub fn collectDownloadTasks(
             } else {
                 errdefer gpa.free(cr);
                 errdefer gpa.free(cl);
-                try out.append(gpa, .{ .direction = .download, .local = cl, .remote = cr });
+                const sz: u64 = if ((e.attrs.flags & packets.ATTR_SIZE) != 0) e.attrs.size else 0;
+                try out.append(gpa, .{ .direction = .download, .local = cl, .remote = cr, .size = sz });
             }
         }
     }
@@ -758,6 +862,9 @@ fn ParallelCtx(comptime Opener: type) type {
         opener: Opener,
         next: std.atomic.Value(usize),
         errors: std.atomic.Value(u32),
+        /// Non-null when the aggregate renderer is active; workers bump
+        /// files_done per task and keep skip logs off the live aggregate line.
+        prog: ?*ParallelProgress = null,
     };
 }
 
@@ -776,24 +883,40 @@ fn parallelWorker(comptime Opener: type, ctx: *ParallelCtx(Opener)) void {
         const t = ctx.tasks[idx];
         switch (t.direction) {
             .upload => uploadFile(ctx.gpa, io, &conn.sess, t.local, t.remote, ctx.opts) catch |err| {
-                std.debug.print("zioscp: skipping {s}: {s}\n", .{ t.local, @errorName(err) });
-                _ = ctx.errors.fetchAdd(1, .monotonic);
+                skipLog(ctx, t.local, err);
             },
             .download => downloadFile(ctx.gpa, io, &conn.sess, t.remote, t.local, ctx.opts) catch |err| {
-                std.debug.print("zioscp: skipping {s}: {s}\n", .{ t.remote, @errorName(err) });
-                _ = ctx.errors.fetchAdd(1, .monotonic);
+                skipLog(ctx, t.remote, err);
             },
         }
+        // Each task is processed exactly once; bump the aggregate file count
+        // whether it succeeded or was skipped (failures are also counted).
+        if (ctx.prog) |pp| _ = pp.files_done.fetchAdd(1, .monotonic);
     }
+}
+
+/// Log a per-file skip + count it. When the aggregate renderer is live, lead
+/// with a newline so the message lands below the moving line instead of
+/// clobbering it (the renderer's next `\r` redraws on the line below).
+fn skipLog(ctx: anytype, path: []const u8, err: anyerror) void {
+    if (ctx.prog != null) {
+        std.debug.print("\nzioscp: skipping {s}: {s}\n", .{ path, @errorName(err) });
+    } else {
+        std.debug.print("zioscp: skipping {s}: {s}\n", .{ path, @errorName(err) });
+    }
+    _ = ctx.errors.fetchAdd(1, .monotonic);
 }
 
 /// Run a batch of file tasks across `jobs` worker threads, each with its own
 /// connection + session (so up to `jobs` files transfer concurrently). Tasks are
-/// distributed lock-free via an atomic index. Progress bars are disabled (K
-/// interleaving bars would be garbage); parallel mode is quiet.
+/// distributed lock-free via an atomic index. Per-file bars are off (K
+/// interleaving bars would be garbage); instead, when stderr is a TTY, a single
+/// aggregate line tracks the whole run (files X/Y, bytes, throughput, ETA) via a
+/// renderer thread over shared atomics. Non-interactive runs stay quiet.
 pub fn runParallel(
     comptime Opener: type,
     gpa: std.mem.Allocator,
+    io: std.Io,
     opener: Opener,
     tasks: []const Task,
     opts: Options,
@@ -801,7 +924,20 @@ pub fn runParallel(
 ) !void {
     if (tasks.len == 0) return;
     var quiet_opts = opts;
-    quiet_opts.progress = false;
+    quiet_opts.progress = false; // suppress per-file bars; the aggregate covers it
+
+    // Aggregate progress is TTY-gated: only spin up the renderer interactively.
+    const render = opts.progress and stderrIsTty(io);
+    var prog: ParallelProgress = undefined;
+    var renderer_thread: ?std.Thread = null;
+    if (render) {
+        var total_bytes: u64 = 0;
+        for (tasks) |t| total_bytes += t.size;
+        prog = ParallelProgress.init(total_bytes, @intCast(tasks.len), std.Io.Clock.now(.awake, io).nanoseconds);
+        quiet_opts.shared_done = &prog.bytes_done;
+        renderer_thread = std.Thread.spawn(.{}, progressRenderer, .{ &prog, io }) catch null;
+    }
+
     var ctx: ParallelCtx(Opener) = .{
         .gpa = gpa,
         .opts = quiet_opts,
@@ -809,6 +945,7 @@ pub fn runParallel(
         .opener = opener,
         .next = std.atomic.Value(usize).init(0),
         .errors = std.atomic.Value(u32).init(0),
+        .prog = if (render) &prog else null,
     };
     const j: usize = @min(@as(usize, @intCast(jobs)), tasks.len);
     const threads = try gpa.alloc(std.Thread, j);
@@ -816,10 +953,20 @@ pub fn runParallel(
     for (0..j) |i| {
         threads[i] = std.Thread.spawn(.{}, parallelWorker, .{ Opener, &ctx }) catch |err| {
             for (threads[0..i]) |t| t.join();
+            if (renderer_thread) |rt| {
+                prog.stop.store(true, .monotonic);
+                rt.join();
+                std.debug.print("\n", .{});
+            }
             return err;
         };
     }
     for (threads) |t| t.join();
+    if (renderer_thread) |rt| {
+        prog.stop.store(true, .monotonic);
+        rt.join();
+        std.debug.print("\n", .{});
+    }
     // Per-file failures are logged + counted in the workers (the remaining
     // files still transfer, matching scp's "skip and continue"). But a run with
     // any failure must surface a non-zero exit, not silently succeed.

@@ -243,7 +243,7 @@ pub fn main(init: std.process.Init) !void {
                     bail("collect failed: {s}", .{@errorName(err)});
             coll.deinit();
             const opener = tl.Opener{ .host = s.host, .port = s.port, .user = s.user, .key = s.key, .mode = v.host_key_check, .known_hosts = s.kh };
-            engine.runParallel(tl.Opener, gpa, opener, list.items, opts, v.jobs) catch |err|
+            engine.runParallel(tl.Opener, gpa, io, opener, list.items, opts, v.jobs) catch |err|
                 bail("parallel transfer failed: {s}", .{@errorName(err)});
         } else {
             var coll = transport.Connection.open(gpa, io, ssh_argv.items) catch |err|
@@ -256,7 +256,7 @@ pub fn main(init: std.process.Init) !void {
                     bail("collect failed: {s}", .{@errorName(err)});
             coll.deinit();
             const opener = engine.SshOpener{ .ssh_argv = ssh_argv.items };
-            engine.runParallel(engine.SshOpener, gpa, opener, list.items, opts, v.jobs) catch |err|
+            engine.runParallel(engine.SshOpener, gpa, io, opener, list.items, opts, v.jobs) catch |err|
                 bail("parallel transfer failed: {s}", .{@errorName(err)});
         }
         return;
