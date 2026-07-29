@@ -25,8 +25,12 @@
             .hash = "zioarg-0.1.0-5X0P9cMKAQC9rbP34EN2_q6tAv_kf_Q16oqSokyrBmgE",
         },
         .zioansi = .{
-            .url = "git+https://github.com/deblasis/zioansi#2e3c6ef42414f16dc4fe36e8d344ef2c1b604189",
-            .hash = "zioansi-0.1.0-37xjpu9NAABTobfehzsUzVQe75j5GLuH6i1uovMEAa9D",
+            .url = "git+https://github.com/deblasis/zioansi?ref=v0.2.0#15bc5d7ece5a0b934548c848fe785345c726b155",
+            .hash = "zioansi-0.2.0-37xjphVQAACNYNtWo8eG9vvJTIYBH_MJDFYTGOdN35pq",
+        },
+        .zioconsole = .{
+            .url = "git+https://github.com/deblasis/zioconsole?ref=v0.1.3#bc6168a4ad4419a1316d3b4edcb2951ea1eac79d",
+            .hash = "zioconsole-0.1.3-ZTu-b-MnAADSPD3bF_8ERg1GhCLwEgb7LqnRuBHZJ0bV",
         },
     },
     .paths = .{

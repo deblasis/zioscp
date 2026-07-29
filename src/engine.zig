@@ -13,6 +13,7 @@ const packets = @import("sftp/packets.zig");
 const resume_mod = @import("resume.zig");
 const zioprogress = @import("zioprogress");
 const zioansi = @import("zioansi");
+const zioconsole = @import("zioconsole");
 const ziorate = @import("ziorate");
 const transport = @import("transport.zig");
 const chunker = @import("chunker.zig");
@@ -277,17 +278,17 @@ const ParallelProgress = struct {
 /// Renderer thread body: ticks ~10/s, drawing the aggregate line until `stop` is
 /// set, then one final render at completion. Uses the caller's io (clock reads
 /// and a short sleep are thread-safe and the main thread is blocked in join).
-fn progressRenderer(pp: *ParallelProgress, io: std.Io) void {
+fn progressRenderer(pp: *ParallelProgress, io: std.Io, live: *zioconsole.Live) void {
     var bar = zioprogress.ProgressBar.init(.{ .width = 20 }, if (pp.total_bytes == 0) 1 else pp.total_bytes);
     var buf: [256]u8 = undefined;
     while (!pp.stop.load(.monotonic)) {
         std.Io.sleep(io, .{ .nanoseconds = 100_000_000 }, .awake) catch {};
         const s = pp.line(std.Io.Clock.now(.awake, io).nanoseconds, &bar, &buf);
-        if (s.len > 0) std.debug.print("\r{s} \x1b[K", .{s});
+        if (s.len > 0) live.set(s);
     }
     // Final render reflects the completed totals.
     const s = pp.line(std.Io.Clock.now(.awake, io).nanoseconds, &bar, &buf);
-    if (s.len > 0) std.debug.print("\r{s} \x1b[K", .{s});
+    if (s.len > 0) live.set(s);
 }
 
 /// Adaptive sliding-window controller for the SFTP pipeline. Sizes the in-flight
@@ -865,29 +866,50 @@ fn ParallelCtx(comptime Opener: type) type {
         /// Non-null when the aggregate renderer is active; workers bump
         /// files_done per task and keep skip logs off the live aggregate line.
         prog: ?*ParallelProgress = null,
+        /// The inline live display: workers println one line per file (scp-style,
+        /// scrolling above the pinned aggregate bar). Always set in runParallel.
+        live: ?*zioconsole.Live = null,
     };
 }
 
 /// Worker thread body: its own Threaded io + connection, pulls tasks by atomic
 /// index until none remain. A per-file error is logged + counted, not fatal (the
-/// remaining tasks still run on other workers).
+/// remaining tasks still run on other workers). Each completed file prints one
+/// scp-style line through the live display (scrolling above the pinned aggregate
+/// bar); failures print a "✗ path: reason" line.
 fn parallelWorker(comptime Opener: type, ctx: *ParallelCtx(Opener)) void {
     var threaded = std.Io.Threaded.init(ctx.gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var conn = ctx.opener.open(ctx.gpa, io) catch return;
     defer conn.deinit();
+    var line: [400]u8 = undefined;
     while (true) {
         const idx = ctx.next.fetchAdd(1, .monotonic);
         if (idx >= ctx.tasks.len) break;
         const t = ctx.tasks[idx];
-        switch (t.direction) {
-            .upload => uploadFile(ctx.gpa, io, &conn.sess, t.local, t.remote, ctx.opts) catch |err| {
-                skipLog(ctx, t.local, err);
+        const src = if (t.direction == .upload) t.local else t.remote;
+        const ok = switch (t.direction) {
+            .upload => blk: {
+                uploadFile(ctx.gpa, io, &conn.sess, t.local, t.remote, ctx.opts) catch |err| {
+                    logFileFail(ctx, &line, src, err);
+                    break :blk false;
+                };
+                break :blk true;
             },
-            .download => downloadFile(ctx.gpa, io, &conn.sess, t.remote, t.local, ctx.opts) catch |err| {
-                skipLog(ctx, t.remote, err);
+            .download => blk: {
+                downloadFile(ctx.gpa, io, &conn.sess, t.remote, t.local, ctx.opts) catch |err| {
+                    logFileFail(ctx, &line, src, err);
+                    break :blk false;
+                };
+                break :blk true;
             },
+        };
+        if (ok) {
+            if (ctx.live) |live| {
+                const s = fileLine(&line, "✓", src, t.size);
+                if (s.len > 0) live.println(s);
+            }
         }
         // Each task is processed exactly once; bump the aggregate file count
         // whether it succeeded or was skipped (failures are also counted).
@@ -895,14 +917,17 @@ fn parallelWorker(comptime Opener: type, ctx: *ParallelCtx(Opener)) void {
     }
 }
 
-/// Log a per-file skip + count it. When the aggregate renderer is live, lead
-/// with a newline so the message lands below the moving line instead of
-/// clobbering it (the renderer's next `\r` redraws on the line below).
-fn skipLog(ctx: anytype, path: []const u8, err: anyerror) void {
-    if (ctx.prog != null) {
-        std.debug.print("\nzioscp: skipping {s}: {s}\n", .{ path, @errorName(err) });
-    } else {
-        std.debug.print("zioscp: skipping {s}: {s}\n", .{ path, @errorName(err) });
+/// Format "mark path  (size)" into buf (e.g. "✓ deploy/app.js  (2.3 MiB)").
+fn fileLine(buf: []u8, mark: []const u8, path: []const u8, size: u64) []const u8 {
+    var sz: [16]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s} {s}  ({s})", .{ mark, path, humanCount(&sz, size) }) catch "";
+}
+
+/// Log a per-file failure through the live display and count it.
+fn logFileFail(ctx: anytype, buf: []u8, path: []const u8, err: anyerror) void {
+    if (ctx.live) |live| {
+        const s = std.fmt.bufPrint(buf, "✗ {s}: {s}", .{ path, @errorName(err) }) catch "";
+        if (s.len > 0) live.println(s);
     }
     _ = ctx.errors.fetchAdd(1, .monotonic);
 }
@@ -910,9 +935,11 @@ fn skipLog(ctx: anytype, path: []const u8, err: anyerror) void {
 /// Run a batch of file tasks across `jobs` worker threads, each with its own
 /// connection + session (so up to `jobs` files transfer concurrently). Tasks are
 /// distributed lock-free via an atomic index. Per-file bars are off (K
-/// interleaving bars would be garbage); instead, when stderr is a TTY, a single
-/// aggregate line tracks the whole run (files X/Y, bytes, throughput, ETA) via a
-/// renderer thread over shared atomics. Non-interactive runs stay quiet.
+/// interleaving bars would be garbage); instead a zioconsole Live display shows
+/// one scp-style line per file scrolling above a single pinned aggregate bar
+/// (files X/Y, bytes, throughput, ETA) driven by a renderer thread over shared
+/// atomics. When stderr is not a TTY there is no bar and each file line is
+/// printed verbatim, so pipes/CI get a clean per-file log.
 pub fn runParallel(
     comptime Opener: type,
     gpa: std.mem.Allocator,
@@ -926,16 +953,18 @@ pub fn runParallel(
     var quiet_opts = opts;
     quiet_opts.progress = false; // suppress per-file bars; the aggregate covers it
 
-    // Aggregate progress is TTY-gated: only spin up the renderer interactively.
+    // The aggregate bar is TTY-gated (no bar when piped); the per-file log lines
+    // flow through the Live either way (verbatim when not a TTY).
     const render = opts.progress and stderrIsTty(io);
     var prog: ParallelProgress = undefined;
+    var live: zioconsole.Live = zioconsole.Live.init(io, .{});
     var renderer_thread: ?std.Thread = null;
     if (render) {
         var total_bytes: u64 = 0;
         for (tasks) |t| total_bytes += t.size;
         prog = ParallelProgress.init(total_bytes, @intCast(tasks.len), std.Io.Clock.now(.awake, io).nanoseconds);
         quiet_opts.shared_done = &prog.bytes_done;
-        renderer_thread = std.Thread.spawn(.{}, progressRenderer, .{ &prog, io }) catch null;
+        renderer_thread = std.Thread.spawn(.{}, progressRenderer, .{ &prog, io, &live }) catch null;
     }
 
     var ctx: ParallelCtx(Opener) = .{
@@ -946,6 +975,7 @@ pub fn runParallel(
         .next = std.atomic.Value(usize).init(0),
         .errors = std.atomic.Value(u32).init(0),
         .prog = if (render) &prog else null,
+        .live = &live,
     };
     const j: usize = @min(@as(usize, @intCast(jobs)), tasks.len);
     const threads = try gpa.alloc(std.Thread, j);
@@ -956,8 +986,8 @@ pub fn runParallel(
             if (renderer_thread) |rt| {
                 prog.stop.store(true, .monotonic);
                 rt.join();
-                std.debug.print("\n", .{});
             }
+            live.finish();
             return err;
         };
     }
@@ -965,8 +995,9 @@ pub fn runParallel(
     if (renderer_thread) |rt| {
         prog.stop.store(true, .monotonic);
         rt.join();
-        std.debug.print("\n", .{});
     }
+    // Scroll the final aggregate line into scrollback (no-op when no bar was drawn).
+    live.finish();
     // Per-file failures are logged + counted in the workers (the remaining
     // files still transfer, matching scp's "skip and continue"). But a run with
     // any failure must surface a non-zero exit, not silently succeed.
