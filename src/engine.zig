@@ -12,6 +12,7 @@ const client = @import("sftp/client.zig");
 const packets = @import("sftp/packets.zig");
 const resume_mod = @import("resume.zig");
 const zioprogress = @import("zioprogress");
+const zioansi = @import("zioansi");
 const ziorate = @import("ziorate");
 const transport = @import("transport.zig");
 const chunker = @import("chunker.zig");
@@ -81,41 +82,128 @@ fn stderrIsTty(io: std.Io) bool {
     return std.Io.File.stderr().isTty(io) catch false;
 }
 
-/// TTY-gated progress bar. Renders only when interactive (opts.progress and
-/// stderr is a TTY), so tests and pipes stay quiet. Re-renders only on a
-/// percentage change to keep large transfers from flooding stderr.
+/// Human-readable byte count (KiB/MiB/...). Writes into `buf`, returns a slice.
+fn humanCount(buf: []u8, bytes: u64) []const u8 {
+    const units = [_][]const u8{ "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+    var idx: usize = 0;
+    var v: f64 = @floatFromInt(bytes);
+    while (v >= 1024.0 and idx < units.len - 1) {
+        v /= 1024.0;
+        idx += 1;
+    }
+    if (idx == 0) return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "B";
+    return std.fmt.bufPrint(buf, "{d:.1} {s}", .{ v, units[idx] }) catch "?";
+}
+
+/// mm:ss or h:mm:ss ETA from seconds. "--:--" while no rate yet.
+fn fmtEta(buf: []u8, secs: f64) []const u8 {
+    if (!(secs > 0.0) or std.math.isInf(secs) or std.math.isNan(secs)) return "--:--";
+    const clamped = @min(secs, 359999.0);
+    const s: u64 = @intFromFloat(clamped);
+    const h = s / 3600;
+    const m = (s % 3600) / 60;
+    const sec = s % 60;
+    if (h > 0) return std.fmt.bufPrint(buf, "{d}:{d:0>2}:{d:0>2}", .{ h, m, sec }) catch "?";
+    return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ m, sec }) catch "?";
+}
+
+/// TTY-gated progress display: a moving bar plus throughput, bytes done, and an
+/// ETA. Renders only when interactive (opts.progress and stderr is a TTY), so
+/// tests and pipes stay quiet. Re-renders on a percent change OR at most ~10/s,
+/// so the bar moves smoothly without flooding stderr or stalling the transfer.
+/// Throughput is the cumulative average of THIS run (bytes since resume / elapsed),
+/// which is stable and converges; ETA is remaining / rate. Styled via zioansi,
+/// zero allocation in the render path (comptime ANSI codes + stack buffers).
 const Progress = struct {
     bar: zioprogress.ProgressBar,
+    io: std.Io,
+    total: u64,
+    start_done: u64, // bytes already present at (re)start; rate counts only new bytes
     last_pct: u8,
+    last_render_ns: i96,
+    start_ns: i96,
     show: bool,
+    label_buf: [28]u8 = undefined,
+    label_len: u8 = 0,
+
+    // Comptime format: label + bar in cyan, the stats line dim. The ANSI codes
+    // come from zioansi's tables; the {s} slots are filled at runtime.
+    const LINE =
+        zioansi.Color.cyan.fg() ++ "{s}  {s}" ++ zioansi.reset ++ "  " ++
+        zioansi.Style.dim.enable() ++ "{s}/{s}  {s}/s  eta {s}" ++ zioansi.reset;
 
     fn start(io: std.Io, label: []const u8, total: u64, opts: Options, resume_off: u64) Progress {
+        const now = std.Io.Clock.now(.awake, io).nanoseconds;
         var p: Progress = .{
-            .bar = zioprogress.ProgressBar.init(.{ .prefix = label, .width = 30 }, total),
+            .bar = zioprogress.ProgressBar.init(.{ .width = 26 }, total),
+            .io = io,
+            .total = total,
+            .start_done = resume_off,
             .last_pct = 255,
+            .last_render_ns = now,
+            .start_ns = now,
             .show = opts.progress and stderrIsTty(io),
         };
         p.bar.current = resume_off;
+        // Keep the tail of long paths (filenames matter more than the prefix).
+        const max = p.label_buf.len;
+        const lbl = if (label.len > max) label[label.len - max ..] else label;
+        @memcpy(p.label_buf[0..lbl.len], lbl);
+        p.label_len = @intCast(lbl.len);
         return p;
     }
+
     fn step(self: *Progress, inc: u64) void {
         if (!self.show) return;
         self.bar.advance(inc);
         const pct = self.bar.percent();
-        if (pct != self.last_pct) {
+        const now = std.Io.Clock.now(.awake, self.io).nanoseconds;
+        if (pct != self.last_pct or now - self.last_render_ns > 100_000_000) {
             self.last_pct = pct;
-            self.render();
+            self.last_render_ns = now;
+            self.render(now);
         }
     }
-    fn render(self: *Progress) void {
-        var buf: [256]u8 = undefined;
-        const s = self.bar.render(&buf);
-        std.debug.print("\r{s}", .{s});
+
+    /// Build the progress line into `out` (the stats + bar, with ANSI styling).
+    /// Pure / side-effect-free so it can be unit-tested without a TTY.
+    fn formatLine(self: *Progress, now_ns: i96, out: []u8) []const u8 {
+        var bar_buf: [64]u8 = undefined;
+        var done_buf: [16]u8 = undefined;
+        var tot_buf: [16]u8 = undefined;
+        var rate_buf: [16]u8 = undefined;
+        var eta_buf: [12]u8 = undefined;
+
+        const done: u64 = self.bar.current;
+        const elapsed_s: f64 = @as(f64, @floatFromInt(now_ns - self.start_ns)) / 1_000_000_000.0;
+        const delta: u64 = if (done > self.start_done) done - self.start_done else 0;
+        const rate: f64 = if (elapsed_s > 0.0) @as(f64, @floatFromInt(delta)) / elapsed_s else 0.0;
+        const remaining: u64 = if (self.total > done) self.total - done else 0;
+        const eta_s: f64 = if (rate > 0.0) @as(f64, @floatFromInt(remaining)) / rate else 0.0;
+
+        return std.fmt.bufPrint(out, LINE, .{
+            self.label_buf[0..self.label_len],
+            self.bar.render(&bar_buf),
+            humanCount(&done_buf, done),
+            humanCount(&tot_buf, self.total),
+            humanCount(&rate_buf, @intFromFloat(@max(rate, 0.0))),
+            fmtEta(&eta_buf, eta_s),
+        }) catch "";
     }
+
+    fn render(self: *Progress, now_ns: i96) void {
+        var buf: [256]u8 = undefined;
+        const s = self.formatLine(now_ns, &buf);
+        if (s.len == 0) return;
+        // \r returns to line start; \x1b[K clears to end-of-line so a shorter
+        // re-render never leaves stale tail characters.
+        std.debug.print("\r{s} \x1b[K", .{s});
+    }
+
     fn finish(self: *Progress) void {
         if (!self.show) return;
-        self.bar.current = self.bar.total;
-        self.render();
+        self.bar.current = self.total;
+        self.render(std.Io.Clock.now(.awake, self.io).nanoseconds);
         std.debug.print("\n", .{});
     }
 };
@@ -189,6 +277,39 @@ test "WindowCtl: resumes growth if the pipe drains again" {
     w.observedWait(80_000_000); // a blocking recv: pipe drained again
     w.observedWait(80_000_000);
     try std.testing.expect(w.window > plateau); // grew again
+}
+
+test "Progress line renders bar, rate, and eta" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var p = Progress.start(io, "backup.tar", 100_000_000, .{ .progress = true }, 0);
+    // Simulate 45 MiB transferred over ~5 s of wall clock (rate ~= 9 MiB/s).
+    p.bar.current = 45_000_000;
+    p.start_ns = std.Io.Clock.now(.awake, io).nanoseconds - 5_000_000_000;
+
+    var buf: [256]u8 = undefined;
+    const s = p.formatLine(std.Io.Clock.now(.awake, io).nanoseconds, &buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, s, "backup.tar") != null); // label kept
+    try std.testing.expect(std.mem.indexOf(u8, s, "MiB") != null); // human byte count
+    try std.testing.expect(std.mem.indexOf(u8, s, "/s") != null); // throughput
+    try std.testing.expect(std.mem.indexOf(u8, s, "eta") != null); // ETA slot
+    // 45% should be reflected somewhere in the rendered bar.
+    try std.testing.expect(std.mem.indexOf(u8, s, "45") != null);
+}
+
+test "humanCount and fmtEta format cleanly" {
+    var b: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("0 B", humanCount(&b, 0));
+    try std.testing.expectEqualStrings("1.0 KiB", humanCount(&b, 1024));
+    try std.testing.expectEqualStrings("1.5 MiB", humanCount(&b, 1_572_864));
+
+    var e: [12]u8 = undefined;
+    try std.testing.expectEqualStrings("--:--", fmtEta(&e, 0));
+    try std.testing.expectEqualStrings("1:30", fmtEta(&e, 90));
+    try std.testing.expectEqualStrings("1:02:03", fmtEta(&e, 3723));
 }
 
 /// SFTP v3 guarantees servers can process packets with at least ~34000 bytes

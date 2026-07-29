@@ -24,6 +24,10 @@
             .url = "https://github.com/deblasis/zioarg/archive/refs/tags/v0.1.2.tar.gz",
             .hash = "zioarg-0.1.0-5X0P9cMKAQC9rbP34EN2_q6tAv_kf_Q16oqSokyrBmgE",
         },
+        .zioansi = .{
+            .url = "git+https://github.com/deblasis/zioansi#2e3c6ef42414f16dc4fe36e8d344ef2c1b604189",
+            .hash = "zioansi-0.1.0-37xjpu9NAABTobfehzsUzVQe75j5GLuH6i1uovMEAa9D",
+        },
     },
     .paths = .{
         "build.zig",

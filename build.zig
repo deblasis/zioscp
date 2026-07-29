@@ -51,6 +51,12 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("ziorate", ziorate_mod);
     exe_mod.addImport("zioarg", zioarg_mod);
 
+    const zioansi_mod = b.dependency("zioansi", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zioansi");
+    exe_mod.addImport("zioansi", zioansi_mod);
+
     // Expose the backend choice to the source as a comptime value.
     const build_opts = b.addOptions();
     build_opts.addOption(@TypeOf(backend), "backend", backend);
@@ -150,6 +156,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("ziojson", ziojson_mod);
     test_mod.addImport("zioprogress", zioprogress_mod);
     test_mod.addImport("ziorate", ziorate_mod);
+    test_mod.addImport("zioansi", zioansi_mod);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -167,6 +174,7 @@ pub fn build(b: *std.Build) void {
     integ_mod.addImport("ziojson", ziojson_mod);
     integ_mod.addImport("zioprogress", zioprogress_mod);
     integ_mod.addImport("ziorate", ziorate_mod);
+    integ_mod.addImport("zioansi", zioansi_mod);
     const integ_tests = b.addTest(.{ .root_module = integ_mod });
     const run_integ = b.addRunArtifact(integ_tests);
     const integ_step = b.step("integration", "Run integration tests (needs the Docker sftp harness)");
