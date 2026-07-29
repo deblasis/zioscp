@@ -44,20 +44,23 @@ jobs:
         run: zig build ${{ matrix.backend }} -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
 
       - name: Package
+        # Binary (+ licenses) at the ARCHIVE ROOT (no versioned subdir), so the
+        # installers (brew bin.install, scoop "bin", install.sh/ps1) are simple
+        # and autoupdate works. The asset FILENAME keeps the version+target.
         run: |
           version="${GITHUB_REF_NAME:-nightly}"
-          staging="zioscp-${version}-${{ matrix.target }}"
-          mkdir "$staging"
+          stage="$(mktemp -d)"
           if [ "${{ matrix.target }}" = "x86_64-windows-gnu" ]; then
-            cp zig-out/bin/zioscp.exe "$staging/"
+            cp zig-out/bin/zioscp.exe "$stage/zioscp.exe"
           else
-            cp zig-out/bin/zioscp "$staging/"
+            cp zig-out/bin/zioscp "$stage/zioscp"
           fi
-          cp LICENSE-MIT LICENSE-APACHE "$staging/"
+          cp LICENSE-MIT LICENSE-APACHE "$stage/"
+          asset="zioscp-${version}-${{ matrix.target }}.${{ matrix.archive }}"
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            zip -r "zioscp-${version}-${{ matrix.target }}.zip" "$staging"
+            ( cd "$stage" && zip -r "$PWD/$asset" . )
           else
-            tar -czf "zioscp-${version}-${{ matrix.target }}.tar.gz" "$staging"
+            tar -C "$stage" -czf "$asset" .
           fi
 
       - uses: actions/upload-artifact@v4

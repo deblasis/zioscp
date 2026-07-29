@@ -39,12 +39,12 @@ curl -fsSL -o "$TMP/$ASSET" "$URL"
 if [ "$EXT" = "zip" ]; then
   (command -v unzip >/dev/null || { echo "zioscp: unzip is required" >&2; exit 1; })
   unzip -oq "$TMP/$ASSET" -d "$TMP"
-  BIN=$TMP/zioscp-$TAG-$TARGET/zioscp.exe
 else
   tar -xzf "$TMP/$ASSET" -C "$TMP"
-  BIN=$TMP/zioscp-$TAG-$TARGET/zioscp
 fi
-[ -f "$BIN" ] || { echo "zioscp: download did not contain the binary" >&2; exit 1; }
+# Binary is at the archive root (newer releases) or in a versioned subdir (older).
+BIN=$(find "$TMP" -type f \( -name zioscp -o -name zioscp.exe \) | head -1)
+[ -n "$BIN" ] || { echo "zioscp: download did not contain the binary" >&2; exit 1; }
 
 # --- install -----------------------------------------------------------------
 mkdir -p "$PREFIX"
