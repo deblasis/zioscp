@@ -97,7 +97,7 @@ if [ ! -f "$V/lib/libssh2.a" ]; then
   # --without-libz-prefix keeps libssh2 from pulling in zlib when none is requested.
   CC="$CC" AR="zig ar" RANLIB="zig ar s" \
     CFLAGS="-O2 -I$V/include" LDFLAGS="-L$V/lib" LIBS="-lssl -lcrypto -lm" \
-    ./configure "${HOST_ARG[@]}" --with-crypto=openssl --without-libz-prefix \
+    ./configure ${HOST_ARG[@]+"${HOST_ARG[@]}"} --with-crypto=openssl --without-libz-prefix \
       --disable-shared --enable-static --prefix="$V" \
       > "$WORK/libssh2_configure.log" 2>&1
   # libtool guesses MSVC for mingw + a non-gcc CC, baking 'lib -OUT:' (the MSVC
