@@ -79,7 +79,7 @@ fn bail(comptime fmt: []const u8, args: anytype) noreturn {
 fn printHelp(io: std.Io) void {
     var buf: [4096]u8 = undefined;
     var fw = std.Io.File.stderr().writer(io, &buf);
-    zioarg.formatHelp(Args, &fw.interface) catch {};
+    zioarg.formatHelp(Args, &fw.interface, "zioscp") catch {};
     fw.interface.flush() catch {};
 }
 
@@ -164,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         },
         else => {
-            zioarg.reportError(Args, err);
+            zioarg.reportError(Args, err, "zioscp");
             printHelp(io);
             std.process.exit(1);
         },
