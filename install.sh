@@ -4,11 +4,22 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/deblasis/zioscp/master/install.sh | sh
 #
-# Options (env): PREFIX=/some/dir  -> install there instead of ~/.local/bin.
+# Install elsewhere (either form works):
+#   curl -fsSL https://raw.githubusercontent.com/deblasis/zioscp/master/install.sh | sh -s -- --prefix /opt/bin
+#   curl -fsSL https://raw.githubusercontent.com/deblasis/zioscp/master/install.sh | PREFIX=/opt/bin sh
+# (Note: `PREFIX=/x curl ... | sh` does NOT work; pipe scoping puts PREFIX in
+#  curl's env, not sh's. Put PREFIX after the pipe, or use --prefix.)
 set -eu
 
 REPO=deblasis/zioscp
 PREFIX=${PREFIX:-$HOME/.local/bin}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix) PREFIX=$2; shift 2 ;;
+    --prefix=*) PREFIX=${1#--prefix=}; shift ;;
+    *) shift ;;
+  esac
+done
 
 # --- detect target -----------------------------------------------------------
 OS=$(uname -s)

@@ -24,6 +24,10 @@ Expand-Archive -Path $zip -DestinationPath $extract -Force
 
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 $exe = Get-ChildItem -Path $extract -Filter "zioscp.exe" -Recurse | Select-Object -First 1
+# Clear the Mark-of-the-Web so SmartScreen does not gate the first run on a
+# clean machine. (This does NOT affect antivirus false positives, which are a
+# separate, known issue with unsigned static binaries.)
+Unblock-File -Path $exe.FullName -ErrorAction SilentlyContinue
 Move-Item $exe.FullName (Join-Path $Dest "zioscp.exe") -Force
 Remove-Item $zip, $extract -Recurse -Force
 
@@ -36,3 +40,4 @@ if ($path -and ($path -split ';') -notcontains $Dest) {
     Write-Host "zioscp: $Dest already on PATH"
 }
 Write-Host "zioscp: installed $tag to $(Join-Path $Dest 'zioscp.exe')"
+& (Join-Path $Dest 'zioscp.exe') --version

@@ -21,10 +21,11 @@ const Args = struct {
     bwlimit: u64 = 0,
     jobs: u32 = 1,
     verbose: bool = false,
+    version: bool = false,
     host_key_check: engine.HostKeyCheck = .strict,
     files: []const []const u8 = &.{},
 
-    pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p', .jobs = 'j', .verbose = 'v' };
+    pub const short = .{ .port = 'P', .identity = 'i', .recursive = 'r', .preserve = 'p', .jobs = 'j', .verbose = 'v', .version = 'V' };
     pub const help = .{
         .port = "ssh port (default 22)",
         .identity = "identity file",
@@ -35,8 +36,9 @@ const Args = struct {
         .bwlimit = "limit transfer to N bytes/sec (default unlimited)",
         .jobs = "parallel transfer connections for -r (default 1)",
         .verbose = "print one progress line per file to stderr",
-        .host_key_check = "server host key check: strict (default) | accept-new | no (mirrors ssh StrictHostKeyChecking)",
-        .files = "src dest (one remote [user@]host:path, one local)",
+        .version = "print version and exit",
+        .host_key_check = "host key check: strict | accept-new | no",
+        .files = "src dest (one is [user@]host:path)",
     };
 };
 
@@ -151,6 +153,14 @@ pub fn main(init: std.process.Init) !void {
     };
     defer parsed.deinit(gpa);
     const v = parsed.value;
+
+    if (v.version) {
+        var vbuf: [128]u8 = undefined;
+        var vw = std.Io.File.stdout().writer(io, &vbuf);
+        vw.interface.print("zioscp {s}\n", .{config.version}) catch {};
+        vw.interface.flush() catch {};
+        return;
+    }
 
     if (v.files.len != 2) {
         printHelp(io);
