@@ -115,11 +115,17 @@ ratios are the stable signal.
 
 ## Design
 
-Built on the deblasis zio fleet: **zioarg** (CLI parsing), **ziojson** (resume
-sidecar), **ziocrypt** (per-chunk SHA-256 MACs via `chunker`), **ziorate**
-(bandwidth pacing), **zioprogress** (progress bar). The `ssh ... sftp-server`
-subprocess duplex is hand-written in `transport.zig` (stderr drain, no
-deadlocks, child reap on every path). See the internal repo for the design doc.
+Built on the deblasis zio fleet: [zioarg](https://github.com/deblasis/zioarg)
+(CLI parsing), [ziojson](https://github.com/deblasis/ziojson) (resume sidecar),
+[ziocrypt](https://github.com/deblasis/ziocrypt) (per-chunk SHA-256 MACs via
+`chunker`), [ziorate](https://github.com/deblasis/ziorate) (bandwidth pacing),
+[zioprogress](https://github.com/deblasis/zioprogress) (progress bars),
+[zioansi](https://github.com/deblasis/zioansi) (ANSI styling), and
+[zioconsole](https://github.com/deblasis/zioconsole) (inline live terminal
+display — the scrolling per-file log + pinned status bar). The
+`ssh ... sftp-server` subprocess duplex is hand-written in `transport.zig`
+(stderr drain, no deadlocks, child reap on every path). See the internal repo
+for the design doc.
 
 ## License
 
