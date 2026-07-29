@@ -79,11 +79,19 @@ jobs:
         with:
           path: assets
           merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        # sha256sum emits "<hash>  <basename>" per asset. This lets users verify
+        # downloads (`sha256sum -c SHA256SUMS.txt`), feeds the Scoop bucket's
+        # autoupdate (it matches the line by basename), and gives ready-to-paste
+        # hashes for the Homebrew Formula.
+        run: |
+          cd assets
+          sha256sum zioscp-* | tee SHA256SUMS.txt
       - name: Create release + upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" --generate-notes --target master || true
-          gh release upload "$GITHUB_REF_NAME" assets/zioscp-* --clobber
+          gh release upload "$GITHUB_REF_NAME" assets/zioscp-* assets/SHA256SUMS.txt --clobber
           echo "--- released assets ---"
           gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'
