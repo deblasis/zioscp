@@ -1,0 +1,85 @@
+name: Release binaries
+
+# Build self-contained zioscp binaries for all supported targets and attach them
+# to the GitHub Release for the pushed tag. Uses -Dbackend=libssh2 so every
+# binary is self-contained (no ssh/libssh2/openssl dependency).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # to create the release + upload assets
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS binaries need the native SDK (Security/CoreFoundation frameworks).
+          - { runner: macos-latest, target: aarch64-macos,   archive: tar.gz }
+          - { runner: macos-latest, target: x86_64-macos,    archive: tar.gz }
+          # Linux + Windows cross-compile cleanly from Linux via zig cc.
+          - { runner: ubuntu-latest, target: x86_64-linux-gnu,  archive: tar.gz }
+          - { runner: ubuntu-latest, target: aarch64-linux-gnu, archive: tar.gz }
+          - { runner: ubuntu-latest, target: x86_64-windows-gnu, archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install vendor build deps (libssh2+openssl from source)
+        if: runner_os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq autoconf automake libtool perl make curl
+
+      - name: Install vendor build deps (macOS)
+        if: runner_os == 'macOS'
+        run: brew install autoconf automake libtool
+
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build (self-contained libssh2 backend, ReleaseFast)
+        run: zig build -Dbackend=libssh2 -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME:-nightly}"
+          staging="zioscp-${version}-${{ matrix.target }}"
+          mkdir "$staging"
+          if [ "${{ matrix.target }}" = "x86_64-windows-gnu" ]; then
+            cp zig-out/bin/zioscp.exe "$staging/"
+          else
+            cp zig-out/bin/zioscp "$staging/"
+          fi
+          cp LICENSE-MIT LICENSE-APACHE "$staging/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "zioscp-${version}-${{ matrix.target }}.zip" "$staging"
+          else
+            tar -czf "zioscp-${version}-${{ matrix.target }}.tar.gz" "$staging"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zioscp-${{ matrix.target }}
+          path: zioscp-*-${{ matrix.target }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create release + upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes --target master || true
+          gh release upload "$GITHUB_REF_NAME" assets/zioscp-* --clobber
+          echo "--- released assets ---"
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'
