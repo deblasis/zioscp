@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
 
     // Expose the backend choice + project version to the source as comptime values.
     // Keep `version` in sync with build.zig.zon `.version` (consumed by --version).
-    const version = "0.7.0";
+    const version = "0.7.1";
     const build_opts = b.addOptions();
     build_opts.addOption(@TypeOf(backend), "backend", backend);
     build_opts.addOption([]const u8, "version", version);
