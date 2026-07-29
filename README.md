@@ -1,9 +1,9 @@
 # zioscp
 
 A drop-in `scp` replacement written in Zig. Same flags and syntax as `scp`, but
-it speaks SFTP under the hood over a system `ssh` subprocess, so it can **resume
-interrupted transfers** and run **parallel transfers** (file-level and
-single-file chunked). Works against any unmodified `sshd`.
+it speaks SFTP under the hood, so it can **resume interrupted transfers** and run
+**parallel transfers** (file-level and single-file chunked). Works against any
+unmodified `sshd`.
 
 ## Features
 
@@ -34,20 +34,31 @@ just ci            # fmt-check + build + tests + cross matrix (what CI runs)
 just integration   # SFTP round-trip tests vs a Docker sshd (heavier)
 ```
 
-The default (ssh) backend cross-compiles to Linux and Windows from any host
-(`zig build -Dtarget=x86_64-linux-gnu`, `... x86_64-windows-gnu`); on Windows it
-drives the system OpenSSH (`ssh.exe`, shipped with Windows 10+). `just ci` runs
-that cross matrix.
+`zioscp` cross-compiles to Linux and Windows from any host
+(`zig build -Dtarget=x86_64-linux-gnu`, `... x86_64-windows-gnu`). On Windows the
+default build is the self-contained libssh2 backend, which runs natively with no
+system `ssh` required; on mac/Linux the default drives the system `ssh`. `just
+ci` runs that cross matrix.
 
 ### Transport backend
 
-The default (`-Dbackend=ssh`, the default) drives a system `ssh` subprocess, so
-it works anywhere `ssh` is installed. A **self-contained** backend that links
-libssh2 directly (no `ssh` dependency at all) is also available:
+There are two interchangeable backends, selected with `-Dbackend`:
+
+- **`ssh`** (default on mac/Linux) drives the system `ssh` subprocess, so it
+  works anywhere OpenSSH is installed, with no bundled crypto.
+- **`libssh2`** (default on Windows) links libssh2 directly for a fully
+  self-contained binary with no `ssh`, `libssh2`, or `openssl` dependency.
 
 ```
 zig build -Dbackend=libssh2     # self-contained: no ssh, no libssh2/openssl dylib
 ```
+
+On Windows the default is libssh2 because the ssh-subprocess backend is not
+usable there: `ssh.exe` does not serve a workable SFTP stream over `-s sftp`
+pipes, and the subprocess's overlapped stdio pipes surface EOF before data
+arrives. The libssh2 backend sidesteps both by dialing its own blocking winsock
+socket (it cannot reuse std.Io.net's socket on Windows, which is a raw AFD
+endpoint handle rather than a winsock SOCKET).
 
 This backend vendors **libssh2 1.11.1 (OpenSSL backend) + OpenSSL 3.6.3** and
 builds both statically with `zig cc`, so the resulting binary has no `ssh`,
